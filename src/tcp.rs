@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::context::RPCContext;
+use crate::nfs4_state::NFS4State;
 use crate::rpcwire::*;
 use crate::transaction_tracker::TransactionTracker;
 use crate::vfs::NFSFileSystem;
@@ -23,6 +24,7 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     mount_signal: Option<mpsc::Sender<bool>>,
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
+    nfs4_state: Arc<NFS4State>,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -159,6 +161,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
+            nfs4_state: Arc::new(NFS4State::new(Duration::from_secs(90))),
         })
     }
 
@@ -204,6 +207,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 mount_signal: self.mount_signal.clone(),
                 export_name: self.export_name.clone(),
                 transaction_tracker: self.transaction_tracker.clone(),
+                nfs4_state: self.nfs4_state.clone(),
             };
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);

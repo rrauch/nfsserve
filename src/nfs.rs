@@ -17,6 +17,29 @@ impl nfsstring {
         self.0.is_empty()
     }
 }
+
+impl XDR for Vec<nfsstring> {
+    fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()> {
+        (self.len() as u32).serialize(dest)?;
+        for s in self {
+            s.serialize(dest)?;
+        }
+        Ok(())
+    }
+
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        let mut n = 0u32;
+        n.deserialize(src)?;
+        self.clear();
+        for _ in 0..n {
+            let mut s = nfsstring::default();
+            s.deserialize(src)?;
+            self.push(s);
+        }
+        Ok(())
+    }
+}
+
 impl From<Vec<u8>> for nfsstring {
     fn from(value: Vec<u8>) -> Self {
         Self(value)

@@ -1,10 +1,10 @@
 use std::fmt;
 use std::sync::Arc;
 
-use tokio::sync::mpsc;
-
+use crate::nfs4_state::NFS4State;
 use crate::transaction_tracker::TransactionTracker;
 use crate::vfs::NFSFileSystem;
+use tokio::sync::mpsc;
 
 #[derive(Clone)]
 pub struct RPCContext {
@@ -15,6 +15,7 @@ pub struct RPCContext {
     pub mount_signal: Option<mpsc::Sender<bool>>,
     pub export_name: Arc<String>,
     pub transaction_tracker: Arc<TransactionTracker>,
+    pub(crate) nfs4_state: Arc<NFS4State>,
 }
 
 impl fmt::Debug for RPCContext {

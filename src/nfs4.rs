@@ -715,3 +715,410 @@ impl From<nfstime3> for nfstime4 {
         }
     }
 }
+
+// ---- EXCHANGE_ID (RFC 8881 §18.35) ----
+
+pub const EXCHGID4_FLAG_SUPP_MOVED_REFER: u32 = 0x00000001;
+pub const EXCHGID4_FLAG_SUPP_MOVED_MIGR: u32 = 0x00000002;
+pub const EXCHGID4_FLAG_BIND_PRINC_STATEID: u32 = 0x00000100;
+pub const EXCHGID4_FLAG_USE_NON_PNFS: u32 = 0x00010000;
+pub const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x00020000;
+pub const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x00040000;
+pub const EXCHGID4_FLAG_MASK_PNFS: u32 = 0x00070000;
+pub const EXCHGID4_FLAG_UPD_CONFIRMED_REC_A: u32 = 0x40000000;
+pub const EXCHGID4_FLAG_CONFIRMED_R: u32 = 0x80000000;
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+pub enum state_protect_how4 {
+    SP4_NONE = 0,
+    SP4_MACH_CRED = 1,
+    SP4_SSV = 2,
+}
+impl Default for state_protect_how4 {
+    fn default() -> Self {
+        Self::SP4_NONE
+    }
+}
+xdr_enum_serde!(state_protect_how4);
+
+/// client_owner4: verifier + opaque owner id
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct client_owner4 {
+    pub co_verifier: verifier4,
+    pub co_ownerid: Vec<u8>,
+}
+xdr_struct!(client_owner4, co_verifier, co_ownerid);
+
+/// nfs_impl_id4
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct nfs_impl_id4 {
+    pub nii_domain: utf8str_cis,
+    pub nii_name: utf8str_cs,
+    pub nii_date: nfstime4,
+}
+xdr_struct!(nfs_impl_id4, nii_domain, nii_name, nii_date);
+
+/// Optional<nfs_impl_id4> encoded as array<0..1>
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct impl_id_optional(pub Option<nfs_impl_id4>);
+impl XDR for impl_id_optional {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        match &self.0 {
+            None => 0u32.serialize(dest),
+            Some(v) => {
+                1u32.serialize(dest)?;
+                v.serialize(dest)
+            },
+        }
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        let mut n = 0u32;
+        n.deserialize(src)?;
+        if n == 0 {
+            self.0 = None;
+        } else {
+            let mut v = nfs_impl_id4::default();
+            v.deserialize(src)?;
+            self.0 = Some(v);
+            // skip any extra (spec allows 0..1, but be lenient)
+            for _ in 1..n {
+                let mut d = nfs_impl_id4::default();
+                d.deserialize(src)?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// state_protect4_a — only SP4_NONE decoded fully.
+/// SP4_MACH_CRED / SP4_SSV are decoded enough to stay stream-aligned.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct state_protect4_a {
+    pub spa_how: state_protect_how4,
+    // For SP4_MACH_CRED/SP4_SSV we hold the raw opaque tail so we stay aligned.
+    pub spa_mach_ops: Option<(bitmap4, bitmap4)>, // enforce, allow (MACH_CRED)
+    pub spa_ssv: Option<ssv_sp_parms4>,           // SSV
+}
+impl XDR for state_protect4_a {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        self.spa_how.serialize(dest)?;
+        match self.spa_how {
+            state_protect_how4::SP4_NONE => {},
+            state_protect_how4::SP4_MACH_CRED => {
+                let (e, a) = self.spa_mach_ops.clone().unwrap_or_default();
+                e.serialize(dest)?;
+                a.serialize(dest)?;
+            },
+            state_protect_how4::SP4_SSV => {
+                self.spa_ssv.clone().unwrap_or_default().serialize(dest)?;
+            },
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        self.spa_how.deserialize(src)?;
+        match self.spa_how {
+            state_protect_how4::SP4_NONE => {
+                self.spa_mach_ops = None;
+                self.spa_ssv = None;
+            },
+            state_protect_how4::SP4_MACH_CRED => {
+                let mut e: bitmap4 = Vec::new();
+                let mut a: bitmap4 = Vec::new();
+                e.deserialize(src)?;
+                a.deserialize(src)?;
+                self.spa_mach_ops = Some((e, a));
+            },
+            state_protect_how4::SP4_SSV => {
+                let mut s = ssv_sp_parms4::default();
+                s.deserialize(src)?;
+                self.spa_ssv = Some(s);
+            },
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct ssv_sp_parms4 {
+    pub ssp_ops_enforce: bitmap4,
+    pub ssp_ops_allow: bitmap4,
+    pub ssp_hash_algs: Vec<nfsstring>,
+    pub ssp_encr_algs: Vec<nfsstring>,
+    pub ssp_window: u32,
+    pub ssp_num_gss_handles: u32,
+}
+xdr_struct!(
+    ssv_sp_parms4,
+    ssp_ops_enforce,
+    ssp_ops_allow,
+    ssp_hash_algs,
+    ssp_encr_algs,
+    ssp_window,
+    ssp_num_gss_handles
+);
+
+/// state_protect4_r — server reply. We only ever return SP4_NONE.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct state_protect4_r {
+    pub spr_how: state_protect_how4,
+    // SP4_NONE => nothing further.
+}
+xdr_struct!(state_protect4_r, spr_how);
+
+// EXCHANGE_ID4args
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EXCHANGE_ID4args {
+    pub eia_clientowner: client_owner4,
+    pub eia_flags: u32,
+    pub eia_state_protect: state_protect4_a,
+    pub eia_client_impl_id: impl_id_optional,
+}
+xdr_struct!(EXCHANGE_ID4args, eia_clientowner, eia_flags, eia_state_protect, eia_client_impl_id);
+
+// server_owner4
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct server_owner4 {
+    pub so_minor_id: u64,
+    pub so_major_id: Vec<u8>,
+}
+xdr_struct!(server_owner4, so_minor_id, so_major_id);
+
+// EXCHANGE_ID4resok
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct EXCHANGE_ID4resok {
+    pub eir_clientid: clientid4,
+    pub eir_sequenceid: sequenceid4,
+    pub eir_flags: u32,
+    pub eir_state_protect: state_protect4_r,
+    pub eir_server_owner: server_owner4,
+    pub eir_server_scope: Vec<u8>,
+    pub eir_server_impl_id: impl_id_optional,
+}
+xdr_struct!(
+    EXCHANGE_ID4resok,
+    eir_clientid,
+    eir_sequenceid,
+    eir_flags,
+    eir_state_protect,
+    eir_server_owner,
+    eir_server_scope,
+    eir_server_impl_id
+);
+
+// ---- CREATE_SESSION (RFC 8881 §18.36) ----
+
+pub const CREATE_SESSION4_FLAG_PERSIST: u32 = 0x00000001;
+pub const CREATE_SESSION4_FLAG_CONN_BACK_CHAN: u32 = 0x00000002;
+pub const CREATE_SESSION4_FLAG_CONN_RDMA: u32 = 0x00000004;
+
+/// channel_attrs4 (RFC 8881 §18.36).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct channel_attrs4 {
+    pub ca_headerpadsize: count4,
+    pub ca_maxrequestsize: count4,
+    pub ca_maxresponsesize: count4,
+    pub ca_maxresponsesize_cached: count4,
+    pub ca_maxoperations: count4,
+    pub ca_maxrequests: count4,
+    /// rdma_ird<0..1> — optional array of one u32.
+    pub ca_rdma_ird: Vec<u32>,
+}
+xdr_struct!(
+    channel_attrs4,
+    ca_headerpadsize,
+    ca_maxrequestsize,
+    ca_maxresponsesize,
+    ca_maxresponsesize_cached,
+    ca_maxoperations,
+    ca_maxrequests,
+    ca_rdma_ird
+);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct callback_sec_parms4 {
+    pub cb_secflavor: u32,
+    /// AUTH_SYS body (authsys_parms) or raw GSS body, kept for alignment.
+    pub cb_sys: Option<cbsp_authsys>,
+    pub cb_gss_raw: Option<Vec<u8>>, // not parsed; we reject GSS anyway
+}
+impl XDR for callback_sec_parms4 {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        self.cb_secflavor.serialize(dest)?;
+        match self.cb_secflavor {
+            0 => {}, // AUTH_NONE: void
+            1 => {
+                self.cb_sys.clone().unwrap_or_default().serialize(dest)?;
+            },
+            _ => {
+                // We never emit GSS; nothing to write for our purposes.
+            },
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        self.cb_secflavor.deserialize(src)?;
+        match self.cb_secflavor {
+            0 => {
+                self.cb_sys = None;
+                self.cb_gss_raw = None;
+            },
+            1 => {
+                let mut s = cbsp_authsys::default();
+                s.deserialize(src)?;
+                self.cb_sys = Some(s);
+            },
+            6 => {
+                // RPCSEC_GSS callback params: gcbp_service (u32) +
+                // gcbp_handle_from_server<> + gcbp_handle_from_client<>.
+                let mut _service = 0u32;
+                _service.deserialize(src)?;
+                let mut h1: Vec<u8> = Vec::new();
+                let mut h2: Vec<u8> = Vec::new();
+                h1.deserialize(src)?;
+                h2.deserialize(src)?;
+                self.cb_gss_raw = Some(Vec::new());
+            },
+            _ => {
+                // Unknown flavor: we cannot know its body length. Abort.
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported callback_sec_parms flavor",
+                ));
+            },
+        }
+        Ok(())
+    }
+}
+
+impl XDR for Vec<callback_sec_parms4> {
+    fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()> {
+        (self.len() as u32).serialize(dest)?;
+        for e in self {
+            e.serialize(dest)?;
+        }
+        Ok(())
+    }
+
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        let mut n = 0u32;
+        n.deserialize(src)?;
+        self.clear();
+        for _ in 0..n {
+            let mut e = callback_sec_parms4::default();
+            e.deserialize(src)?;
+            self.push(e);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct cbsp_authsys {
+    pub stamp: u32,
+    pub machinename: nfsstring,
+    pub uid: u32,
+    pub gid: u32,
+    pub gids: Vec<u32>,
+}
+xdr_struct!(cbsp_authsys, stamp, machinename, uid, gid, gids);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CREATE_SESSION4args {
+    pub csa_clientid: clientid4,
+    pub csa_sequence: sequenceid4,
+    pub csa_flags: u32,
+    pub csa_fore_chan_attrs: channel_attrs4,
+    pub csa_back_chan_attrs: channel_attrs4,
+    pub csa_cb_program: u32,
+    pub csa_sec_parms: Vec<callback_sec_parms4>,
+}
+xdr_struct!(
+    CREATE_SESSION4args,
+    csa_clientid,
+    csa_sequence,
+    csa_flags,
+    csa_fore_chan_attrs,
+    csa_back_chan_attrs,
+    csa_cb_program,
+    csa_sec_parms
+);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CREATE_SESSION4resok {
+    pub csr_sessionid: sessionid4,
+    pub csr_sequence: sequenceid4,
+    pub csr_flags: u32,
+    pub csr_fore_chan_attrs: channel_attrs4,
+    pub csr_back_chan_attrs: channel_attrs4,
+}
+xdr_struct!(
+    CREATE_SESSION4resok,
+    csr_sessionid,
+    csr_sequence,
+    csr_flags,
+    csr_fore_chan_attrs,
+    csr_back_chan_attrs
+);
+
+// ---- DESTROY_SESSION (RFC 8881 §18.37) ----
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DESTROY_SESSION4args {
+    pub dsa_sessionid: sessionid4,
+}
+xdr_struct!(DESTROY_SESSION4args, dsa_sessionid);
+
+// ---- DESTROY_CLIENTID (RFC 8881 §18.50) ----
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct DESTROY_CLIENTID4args {
+    pub dca_clientid: clientid4,
+}
+xdr_struct!(DESTROY_CLIENTID4args, dca_clientid);
+
+// ---- SEQUENCE (RFC 8881 §18.46) ----
+
+pub const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x00000001;
+pub const SEQ4_STATUS_CB_GSS_CONTEXTS_EXPIRING: u32 = 0x00000002;
+pub const SEQ4_STATUS_CB_GSS_CONTEXTS_EXPIRED: u32 = 0x00000004;
+pub const SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED: u32 = 0x00000008;
+pub const SEQ4_STATUS_EXPIRED_SOME_STATE_REVOKED: u32 = 0x00000010;
+pub const SEQ4_STATUS_ADMIN_STATE_REVOKED: u32 = 0x00000020;
+pub const SEQ4_STATUS_RECALLABLE_STATE_REVOKED: u32 = 0x00000040;
+pub const SEQ4_STATUS_LEASE_MOVED: u32 = 0x00000080;
+pub const SEQ4_STATUS_RESTART_RECLAIM_NEEDED: u32 = 0x00000100;
+pub const SEQ4_STATUS_CB_PATH_DOWN_SESSION: u32 = 0x00000200;
+pub const SEQ4_STATUS_BACKCHANNEL_FAULT: u32 = 0x00000400;
+pub const SEQ4_STATUS_DEVID_CHANGED: u32 = 0x00000800;
+pub const SEQ4_STATUS_DEVID_DELETED: u32 = 0x00001000;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SEQUENCE4args {
+    pub sa_sessionid: sessionid4,
+    pub sa_sequenceid: sequenceid4,
+    pub sa_slotid: slotid4,
+    pub sa_highest_slotid: slotid4,
+    pub sa_cachethis: bool,
+}
+xdr_struct!(SEQUENCE4args, sa_sessionid, sa_sequenceid, sa_slotid, sa_highest_slotid, sa_cachethis);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SEQUENCE4resok {
+    pub sr_sessionid: sessionid4,
+    pub sr_sequenceid: sequenceid4,
+    pub sr_slotid: slotid4,
+    pub sr_highest_slotid: slotid4,
+    pub sr_target_highest_slotid: slotid4,
+    pub sr_status_flags: u32,
+}
+xdr_struct!(
+    SEQUENCE4resok,
+    sr_sessionid,
+    sr_sequenceid,
+    sr_slotid,
+    sr_highest_slotid,
+    sr_target_highest_slotid,
+    sr_status_flags
+);
