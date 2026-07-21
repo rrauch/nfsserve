@@ -469,12 +469,12 @@ pub fn prog_unavail_reply_message(xid: u32) -> rpc_msg {
         body: rpc_body::REPLY(reply),
     }
 }
-pub fn prog_mismatch_reply_message(xid: u32, accepted_ver: u32) -> rpc_msg {
+pub fn prog_mismatch_reply_message(xid: u32, accepted_ver_low: u32, accepted_ver_high: u32) -> rpc_msg {
     let reply = reply_body::MSG_ACCEPTED(accepted_reply {
         verf: opaque_auth::default(),
         reply_data: accept_body::PROG_MISMATCH(mismatch_info {
-            low: accepted_ver,
-            high: accepted_ver,
+            low: accepted_ver_low,
+            high: accepted_ver_high,
         }),
     });
     rpc_msg {

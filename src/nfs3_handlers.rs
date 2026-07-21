@@ -124,7 +124,7 @@ pub async fn handle_nfs(
 ) -> Result<(), anyhow::Error> {
     if call.vers != nfs3::VERSION {
         warn!("Invalid NFS Version number {} != {}", call.vers, nfs3::VERSION);
-        prog_mismatch_reply_message(xid, nfs3::VERSION).serialize(output)?;
+        prog_mismatch_reply_message(xid, nfs3::VERSION, nfs3::VERSION).serialize(output)?;
         return Ok(());
     }
     let prog = NFSProgram::from_u32(call.proc).unwrap_or(NFSProgram::INVALID);

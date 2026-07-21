@@ -46,7 +46,7 @@ pub fn handle_portmap(
 ) -> Result<(), anyhow::Error> {
     if call.vers != portmap::VERSION {
         error!("Invalid Portmap Version number {} != {}", call.vers, portmap::VERSION);
-        prog_mismatch_reply_message(xid, portmap::VERSION).serialize(output)?;
+        prog_mismatch_reply_message(xid, portmap::VERSION, portmap::VERSION).serialize(output)?;
         return Ok(());
     }
     let prog = PortmapProgram::from_u32(call.proc).unwrap_or(PortmapProgram::INVALID);
