@@ -4,8 +4,8 @@ use std::time::SystemTime;
 
 use async_trait::async_trait;
 
-use crate::nfs;
-use crate::nfs::*;
+use crate::nfs3;
+use crate::nfs3::*;
 #[derive(Default, Debug)]
 pub struct DirEntrySimple {
     pub fileid: fileid3,
@@ -194,9 +194,9 @@ pub trait NFSFileSystem: Sync {
 
     /// Get static file system Information
     async fn fsinfo(&self, root_fileid: fileid3) -> Result<fsinfo3, nfsstat3> {
-        let dir_attr: nfs::post_op_attr = match self.getattr(root_fileid).await {
-            Ok(v) => nfs::post_op_attr::attributes(v),
-            Err(_) => nfs::post_op_attr::Void,
+        let dir_attr: nfs3::post_op_attr = match self.getattr(root_fileid).await {
+            Ok(v) => nfs3::post_op_attr::attributes(v),
+            Err(_) => nfs3::post_op_attr::Void,
         };
 
         let res = fsinfo3 {
@@ -209,11 +209,11 @@ pub trait NFSFileSystem: Sync {
             wtmult: 1024 * 1024,
             dtpref: 1024 * 1024,
             maxfilesize: 128 * 1024 * 1024 * 1024,
-            time_delta: nfs::nfstime3 {
+            time_delta: nfs3::nfstime3 {
                 seconds: 0,
                 nseconds: 1000000,
             },
-            properties: nfs::FSF_SYMLINK | nfs::FSF_HOMOGENEOUS | nfs::FSF_CANSETTIME,
+            properties: nfs3::FSF_SYMLINK | nfs3::FSF_HOMOGENEOUS | nfs3::FSF_CANSETTIME,
         };
         Ok(res)
     }

@@ -6,7 +6,7 @@ use std::path::Path;
 use tokio::fs::OpenOptions;
 use tracing::debug;
 
-use crate::nfs::*;
+use crate::nfs3::*;
 
 /// Compares if file metadata has changed in a significant way
 #[cfg(any(target_os = "linux", target_os = "macos"))]

@@ -2,7 +2,7 @@ use std::sync::Mutex;
 use std::time::SystemTime;
 
 use async_trait::async_trait;
-use nfsserve::nfs::{self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3};
+use nfsserve::nfs3::{self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3};
 use nfsserve::tcp::*;
 use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
@@ -192,48 +192,48 @@ impl NFSFileSystem for DemoFS {
         let mut fs = self.fs.lock().unwrap();
         let entry = fs.get_mut(id as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
         match setattr.atime {
-            nfs::set_atime::DONT_CHANGE => {},
-            nfs::set_atime::SET_TO_CLIENT_TIME(c) => {
+            nfs3::set_atime::DONT_CHANGE => {},
+            nfs3::set_atime::SET_TO_CLIENT_TIME(c) => {
                 entry.attr.atime = c;
             },
-            nfs::set_atime::SET_TO_SERVER_TIME => {
+            nfs3::set_atime::SET_TO_SERVER_TIME => {
                 let d = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
                 entry.attr.atime.seconds = d.as_secs() as u32;
                 entry.attr.atime.nseconds = d.subsec_nanos();
             },
         };
         match setattr.mtime {
-            nfs::set_mtime::DONT_CHANGE => {},
-            nfs::set_mtime::SET_TO_CLIENT_TIME(c) => {
+            nfs3::set_mtime::DONT_CHANGE => {},
+            nfs3::set_mtime::SET_TO_CLIENT_TIME(c) => {
                 entry.attr.mtime = c;
             },
-            nfs::set_mtime::SET_TO_SERVER_TIME => {
+            nfs3::set_mtime::SET_TO_SERVER_TIME => {
                 let d = SystemTime::now().duration_since(SystemTime::UNIX_EPOCH).unwrap();
                 entry.attr.mtime.seconds = d.as_secs() as u32;
                 entry.attr.mtime.nseconds = d.subsec_nanos();
             },
         };
         match setattr.uid {
-            nfs::set_uid3::uid(u) => {
+            nfs3::set_uid3::uid(u) => {
                 entry.attr.uid = u;
             },
-            nfs::set_uid3::Void => {},
+            nfs3::set_uid3::Void => {},
         }
         match setattr.gid {
-            nfs::set_gid3::gid(u) => {
+            nfs3::set_gid3::gid(u) => {
                 entry.attr.gid = u;
             },
-            nfs::set_gid3::Void => {},
+            nfs3::set_gid3::Void => {},
         }
         match setattr.size {
-            nfs::set_size3::size(s) => {
+            nfs3::set_size3::size(s) => {
                 entry.attr.size = s;
                 entry.attr.used = s;
                 if let FSContents::File(bytes) = &mut entry.contents {
                     bytes.resize(s as usize, 0);
                 }
             },
-            nfs::set_size3::Void => {},
+            nfs3::set_size3::Void => {},
         }
         Ok(entry.attr)
     }
