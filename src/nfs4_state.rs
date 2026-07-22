@@ -1,7 +1,7 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
-use crate::nfs4::{channel_attrs4, clientid4, sequenceid4, sessionid4, slotid4, verifier4};
+use crate::nfs4::{channel_attrs4, clientid4, sequenceid4, sessionid4, slotid4, stateid4, verifier4, NFS4_OTHER_SIZE};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -18,6 +18,24 @@ impl Drop for NFS4State {
     }
 }
 
+struct OpenState {
+    clientid: clientid4,
+    owner: Vec<u8>,
+    fileid: u64,
+    /// Current stateid seqid; bumped on every state-mutating op (e.g. CLOSE
+    /// would consume/close it). Starts at 1.
+    seqid: u32,
+    share_access: u32,
+    share_deny: u32,
+}
+
+#[derive(Default)]
+struct OpenOwnerState {
+    /// Last open_owner seqid seen (OPEN/CLOSE ordering, 4.0-style).
+    /// In 4.1 sequencing is via SEQUENCE, but the field is still carried.
+    last_seqid: u32,
+}
+
 struct Inner {
     lease: Duration,
     /// Per-boot verifier, occupies the high 32 bits of every clientid so that
@@ -29,6 +47,10 @@ struct Inner {
     clientid_index: HashMap<clientid4, Vec<u8>>,
     /// sessionid -> session record
     sessions: HashMap<sessionid4, SessionRecord>,
+    /// stateid.other -> open state record.
+    opens: HashMap<[u8; NFS4_OTHER_SIZE], OpenState>,
+    /// (clientid, open_owner bytes) -> per-owner seqid bookkeeping.
+    open_owners: HashMap<(clientid4, Vec<u8>), OpenOwnerState>,
 }
 
 impl Inner {
@@ -55,11 +77,25 @@ impl Inner {
         }
     }
 
-    /// Remove a client, its reverse index, and all its sessions.
+    /// Generate a collision-free 12-byte stateid.other.
+    fn fresh_stateid_other(&self) -> [u8; NFS4_OTHER_SIZE] {
+        loop {
+            let mut other = [0u8; NFS4_OTHER_SIZE];
+            getrandom::fill(&mut other).expect("OS RNG failure");
+            if !self.opens.contains_key(&other) {
+                break other;
+            }
+        }
+    }
+
+    /// Remove a client, its reverse index, and all its sessions and open file handles.
     fn expire_client(&mut self, ownerid: &[u8]) {
         if let Some(rec) = self.clients.remove(ownerid) {
             self.clientid_index.remove(&rec.clientid);
-            self.sessions.retain(|_, sess| sess.clientid != rec.clientid);
+            let cid = rec.clientid;
+            self.sessions.retain(|_, sess| sess.clientid != cid);
+            self.opens.retain(|_, o| o.clientid != cid);
+            self.open_owners.retain(|(c, _), _| *c != cid);
         }
     }
 
@@ -86,6 +122,7 @@ struct ClientRecord {
     confirmed: bool,
     sessions: Vec<sessionid4>,
     expires: Instant,
+    reclaim_complete: bool,
 }
 
 struct SessionRecord {
@@ -140,6 +177,8 @@ impl NFS4State {
             clients: HashMap::new(),
             clientid_index: HashMap::new(),
             sessions: HashMap::new(),
+            opens: HashMap::new(),
+            open_owners: HashMap::new(),
         }));
 
         let _reaper = {
@@ -195,6 +234,7 @@ impl NFS4State {
                 confirmed: false,
                 sessions: Vec::new(),
                 expires: Instant::now() + lease,
+                reclaim_complete: false,
             },
         );
         g.clientid_index.insert(clientid, co_ownerid.to_vec());
@@ -353,10 +393,127 @@ impl NFS4State {
         g.expire_client(&owner);
         DestroyClientIdOutcome::Ok
     }
+
+    /// Mark the client owning `sessionid` as having completed reclaim.
+    /// Idempotent; no-op if the session/client is gone.
+    pub fn set_reclaim_complete(&self, sessionid: &sessionid4) {
+        let mut g = self.inner.lock().unwrap();
+        let clientid = match g.sessions.get(sessionid) {
+            Some(s) => s.clientid,
+            None => return,
+        };
+        if let Some(ownerid) = g.clientid_index.get(&clientid).cloned() {
+            if let Some(rec) = g.clients.get_mut(&ownerid) {
+                rec.reclaim_complete = true;
+            }
+        }
+    }
+
+    /// Record a new open. Always grants (no conflict checking).
+    /// Returns a freshly minted stateid.
+    pub fn open(
+        &self,
+        clientid: clientid4,
+        owner: &[u8],
+        owner_seqid: u32,
+        fileid: u64,
+        share_access: u32,
+        share_deny: u32,
+    ) -> OpenOutcome {
+        let mut g = self.inner.lock().unwrap();
+
+        // Client must exist/be confirmed.
+        if !g.clientid_index.contains_key(&clientid) {
+            return OpenOutcome::StaleClientId;
+        }
+
+        // Track the open_owner seqid (recorded, not strictly enforced in 4.1).
+        g.open_owners.entry((clientid, owner.to_vec())).or_default().last_seqid = owner_seqid;
+
+        let other = g.fresh_stateid_other();
+        g.opens.insert(
+            other,
+            OpenState {
+                clientid,
+                owner: owner.to_vec(),
+                fileid,
+                seqid: 1,
+                share_access,
+                share_deny,
+            },
+        );
+
+        OpenOutcome::Ok {
+            stateid: stateid4 { seqid: 1, other },
+        }
+    }
+
+    /// Validate a stateid for READ/WRITE. Returns the fileid on success.
+    /// Accepts special stateids (all-zero / all-one) as anonymous access.
+    pub fn resolve_stateid(&self, sid: &stateid4) -> ResolveStateid {
+        // Special stateids: seqid 0 or 0xffffffff with all-zero/all-one other.
+        let all_zero = sid.other == [0u8; NFS4_OTHER_SIZE];
+        let all_one = sid.other == [0xffu8; NFS4_OTHER_SIZE];
+        if all_zero || all_one {
+            return ResolveStateid::Special;
+        }
+
+        let g = self.inner.lock().unwrap();
+        match g.opens.get(&sid.other) {
+            Some(o) => ResolveStateid::Open {
+                fileid: o.fileid,
+                share_access: o.share_access,
+            },
+            None => ResolveStateid::Bad,
+        }
+    }
+
+    /// CLOSE: remove the open state. Returns the bumped stateid on success.
+    pub fn close(&self, sid: &stateid4) -> CloseOutcome {
+        let mut g = self.inner.lock().unwrap();
+        match g.opens.remove(&sid.other) {
+            Some(mut o) => {
+                o.seqid = o.seqid.wrapping_add(1);
+                CloseOutcome::Ok {
+                    stateid: stateid4 {
+                        seqid: o.seqid,
+                        other: sid.other,
+                    },
+                }
+            },
+            None => CloseOutcome::Bad,
+        }
+    }
+
+    /// Stable per-boot write verifier (8 bytes). Derived from boot_verifier.
+    pub fn write_verifier(&self) -> [u8; 8] {
+        let g = self.inner.lock().unwrap();
+        let mut v = [0u8; 8];
+        v[0..4].copy_from_slice(&g.boot_verifier.to_le_bytes());
+        // low half constant; only the boot half must change across restarts.
+        v[4..8].copy_from_slice(&0xA5A5_A5A5u32.to_le_bytes());
+        v
+    }
 }
 
 pub enum DestroyClientIdOutcome {
     Ok,
     StaleClientId,
     Busy,
+}
+
+pub enum OpenOutcome {
+    Ok { stateid: stateid4 },
+    StaleClientId,
+}
+
+pub enum ResolveStateid {
+    Open { fileid: u64, share_access: u32 },
+    Special,
+    Bad,
+}
+
+pub enum CloseOutcome {
+    Ok { stateid: stateid4 },
+    Bad,
 }

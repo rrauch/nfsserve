@@ -11,6 +11,7 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
 use std::io::{Read, Write};
+use std::num::TryFromIntError;
 
 // ---- RPC identity ----
 pub const VERSION: u32 = 4;
@@ -23,6 +24,8 @@ pub const NFS4_SESSIONID_SIZE: usize = 16;
 pub const NFS4_LEASE_TIME: u32 = 90;
 
 // ---- Basic type aliases ----
+pub type filename4 = nfsstring;
+pub type nfspath4 = nfsstring;
 pub type nfs_fh4 = nfs_fh;
 pub type fileid4 = u64;
 pub type offset4 = u64;
@@ -46,6 +49,7 @@ pub type attrlist4 = Vec<u8>;
 pub type nfs_lease4 = u32;
 pub type changeid4 = u64;
 pub type secret4 = Vec<u8>;
+pub type nfs_cookie4 = u64;
 
 /// nfsstat4 as defined in RFC 8881 §13.1.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, FromPrimitive, ToPrimitive)]
@@ -439,8 +443,128 @@ impl fattr4 {
                 nseconds: src.mtime.nseconds,
             }),
 
+            // synthetic
+            fh_expire_type: Some(0), // FH4_PERSISTENT
+            link_support: Some(false),
+            symlink_support: Some(true),
+            named_attr: Some(false),
+            unique_handles: Some(true),
+            lease_time: Some(NFS4_LEASE_TIME),
+            rdattr_error: Some(nfsstat4::NFS4_OK),
+
             ..Default::default()
         }
+    }
+
+    /// Clear any attribute whose bit is not set in `req`.
+    /// Bit numbering matches the ascending order used in serialize().
+    pub fn retain_requested(&mut self, req: &bitmap4) {
+        let is_req = |bit: usize| -> bool {
+            let w = bit / 32;
+            w < req.len() && (req[w] & (1 << (bit % 32))) != 0
+        };
+        macro_rules! keep {
+            ($bit:expr, $field:ident) => {
+                if !is_req($bit) {
+                    self.$field = None;
+                }
+            };
+        }
+        keep!(0, supported_attrs);
+        keep!(1, ftype);
+        keep!(2, fh_expire_type);
+        keep!(3, change);
+        keep!(4, size);
+        keep!(5, link_support);
+        keep!(6, symlink_support);
+        keep!(7, named_attr);
+        keep!(8, fsid);
+        keep!(9, unique_handles);
+        keep!(10, lease_time);
+        keep!(11, rdattr_error);
+        keep!(12, acl);
+        keep!(13, aclsupport);
+        keep!(14, archive);
+        keep!(15, cansettime);
+        keep!(16, case_insensitive);
+        keep!(17, case_preserving);
+        keep!(19, filehandle);
+        keep!(20, fileid);
+        keep!(21, files_avail);
+        keep!(22, files_free);
+        keep!(23, files_total);
+        keep!(25, hidden);
+        keep!(26, homogeneous);
+        keep!(27, maxfilesize);
+        keep!(28, maxlink);
+        keep!(29, maxname);
+        keep!(30, maxread);
+        keep!(31, maxwrite);
+        keep!(33, mode);
+        keep!(34, no_trunc);
+        keep!(35, numlinks);
+        keep!(36, owner);
+        keep!(37, owner_group);
+        keep!(41, rawdev);
+        keep!(42, space_avail);
+        keep!(43, space_free);
+        keep!(44, space_total);
+        keep!(45, space_used);
+        keep!(47, time_access);
+        keep!(49, time_backup);
+        keep!(50, time_create);
+        keep!(51, time_delta);
+        keep!(52, time_metadata);
+        keep!(53, time_modify);
+        keep!(55, mounted_on_fileid);
+    }
+
+    /// Build an sattr3 from the settable subset. Returns:
+    ///   (sattr3, attrs_set_bitmap, Err(unsupported_bit))
+    /// If a requested-to-set attribute isn't supported, returns the offending
+    /// bit so the caller can emit NFS4ERR_ATTRNOTSUPP with the attrs set so far.
+    pub fn to_sattr3(&self) -> Result<(crate::nfs3::sattr3, bitmap4), usize> {
+        use crate::nfs3::{sattr3, set_atime, set_mode3, set_mtime, set_size3};
+
+        let mut s = sattr3::default();
+        let mut set_bits = bitmap4::new();
+        let mark = |bits: &mut bitmap4, bit: usize| {
+            let w = bit / 32;
+            while bits.len() <= w {
+                bits.push(0);
+            }
+            bits[w] |= 1 << (bit % 32);
+        };
+
+        if let Some(mode) = self.mode {
+            s.mode = set_mode3::mode(mode);
+            mark(&mut set_bits, 33);
+        }
+        if let Some(size) = self.size {
+            s.size = set_size3::size(size);
+            mark(&mut set_bits, 4);
+        }
+        if let Some(t) = self.time_access {
+            s.atime = set_atime::SET_TO_CLIENT_TIME(t.try_into().unwrap_or_default());
+            mark(&mut set_bits, 47);
+        }
+        if let Some(t) = self.time_modify {
+            s.mtime = set_mtime::SET_TO_CLIENT_TIME(t.try_into().unwrap_or_default());
+            mark(&mut set_bits, 53);
+        }
+        // Unsupported-to-set attrs: reject with the offending bit.
+        if self.owner.is_some() {
+            return Err(36);
+        }
+        if self.owner_group.is_some() {
+            return Err(37);
+        }
+        // time_create, acl, archive, hidden, etc. are not settable here.
+        if self.time_create.is_some() {
+            return Err(50);
+        }
+
+        Ok((s, set_bits))
     }
 }
 
@@ -713,6 +837,18 @@ impl From<nfstime3> for nfstime4 {
             seconds: value.seconds as i64,
             nseconds: value.nseconds,
         }
+    }
+}
+
+impl TryFrom<nfstime4> for nfstime3 {
+    type Error = TryFromIntError;
+
+    fn try_from(value: nfstime4) -> Result<Self, Self::Error> {
+        let seconds = value.seconds.try_into()?;
+        Ok(Self {
+            seconds,
+            nseconds: value.nseconds,
+        })
     }
 }
 
@@ -1122,3 +1258,537 @@ xdr_struct!(
     sr_target_highest_slotid,
     sr_status_flags
 );
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct GETATTR4args {
+    pub attr_request: bitmap4,
+}
+xdr_struct!(GETATTR4args, attr_request);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct PUTFH4args {
+    pub object: nfs_fh4,
+}
+xdr_struct!(PUTFH4args, object);
+
+// ---- ACCESS (RFC 8881 §18.1) ----
+pub const ACCESS4_READ: u32 = 0x00000001;
+pub const ACCESS4_LOOKUP: u32 = 0x00000002;
+pub const ACCESS4_MODIFY: u32 = 0x00000004;
+pub const ACCESS4_EXTEND: u32 = 0x00000008;
+pub const ACCESS4_DELETE: u32 = 0x00000010;
+pub const ACCESS4_EXECUTE: u32 = 0x00000020;
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ACCESS4args {
+    pub access: u32,
+}
+xdr_struct!(ACCESS4args, access);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ACCESS4resok {
+    pub supported: u32,
+    pub access: u32,
+}
+xdr_struct!(ACCESS4resok, supported, access);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct LOOKUP4args {
+    pub objname: component4,
+}
+xdr_struct!(LOOKUP4args, objname);
+
+// ---- READDIR (RFC 8881 §18.23) ----
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct READDIR4args {
+    pub cookie: nfs_cookie4,
+    pub cookieverf: verifier4,
+    pub dircount: count4,
+    pub maxcount: count4,
+    pub attr_request: bitmap4,
+}
+xdr_struct!(READDIR4args, cookie, cookieverf, dircount, maxcount, attr_request);
+
+// ---- stateid4 (RFC 8881 §3.2) ----
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct stateid4 {
+    pub seqid: u32,
+    pub other: [u8; NFS4_OTHER_SIZE],
+}
+xdr_struct!(stateid4, seqid, other);
+
+// ---- OPEN (RFC 8881 §18.16) ----
+
+// share_access / share_deny
+pub const OPEN4_SHARE_ACCESS_READ: u32 = 0x00000001;
+pub const OPEN4_SHARE_ACCESS_WRITE: u32 = 0x00000002;
+pub const OPEN4_SHARE_ACCESS_BOTH: u32 = 0x00000003;
+pub const OPEN4_SHARE_DENY_NONE: u32 = 0x00000000;
+pub const OPEN4_SHARE_DENY_READ: u32 = 0x00000001;
+pub const OPEN4_SHARE_DENY_WRITE: u32 = 0x00000002;
+pub const OPEN4_SHARE_DENY_BOTH: u32 = 0x00000003;
+
+// rflags
+pub const OPEN4_RESULT_CONFIRM: u32 = 0x00000002;
+pub const OPEN4_RESULT_LOCKTYPE_POSIX: u32 = 0x00000004;
+
+// opentype4
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+pub enum opentype4 {
+    #[default]
+    OPEN4_NOCREATE = 0,
+    OPEN4_CREATE = 1,
+}
+xdr_enum_serde!(opentype4);
+
+// createmode4
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+pub enum createmode4 {
+    #[default]
+    UNCHECKED4 = 0,
+    GUARDED4 = 1,
+    EXCLUSIVE4 = 2,
+    EXCLUSIVE4_1 = 3,
+}
+xdr_enum_serde!(createmode4);
+
+/// createhow4 union switched on createmode4.
+/// We only support UNCHECKED4 -> fattr4. GUARDED4 also carries fattr4;
+/// EXCLUSIVE4 carries verifier4; EXCLUSIVE4_1 carries creatverfattr.
+/// We decode enough to stay aligned but only act on UNCHECKED4.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct createhow4 {
+    pub mode: createmode4,
+    pub createattrs: fattr4,   // UNCHECKED4 / GUARDED4
+    pub createverf: verifier4, // EXCLUSIVE4 / EXCLUSIVE4_1
+}
+impl XDR for createhow4 {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        self.mode.serialize(dest)?;
+        match self.mode {
+            createmode4::UNCHECKED4 | createmode4::GUARDED4 => {
+                self.createattrs.serialize(dest)?;
+            },
+            createmode4::EXCLUSIVE4 => {
+                self.createverf.serialize(dest)?;
+            },
+            createmode4::EXCLUSIVE4_1 => {
+                self.createverf.serialize(dest)?;
+                self.createattrs.serialize(dest)?;
+            },
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        self.mode.deserialize(src)?;
+        match self.mode {
+            createmode4::UNCHECKED4 | createmode4::GUARDED4 => {
+                self.createattrs.deserialize(src)?;
+            },
+            createmode4::EXCLUSIVE4 => {
+                self.createverf.deserialize(src)?;
+            },
+            createmode4::EXCLUSIVE4_1 => {
+                self.createverf.deserialize(src)?;
+                self.createattrs.deserialize(src)?;
+            },
+        }
+        Ok(())
+    }
+}
+
+/// openflag4 union switched on opentype4.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct openflag4 {
+    pub opentype: opentype4,
+    pub how: createhow4, // only meaningful when opentype == OPEN4_CREATE
+}
+impl XDR for openflag4 {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        self.opentype.serialize(dest)?;
+        if self.opentype == opentype4::OPEN4_CREATE {
+            self.how.serialize(dest)?;
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        self.opentype.deserialize(src)?;
+        if self.opentype == opentype4::OPEN4_CREATE {
+            self.how.deserialize(src)?;
+        }
+        Ok(())
+    }
+}
+
+// open_claim_type4
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+pub enum open_claim_type4 {
+    #[default]
+    CLAIM_NULL = 0,
+    CLAIM_PREVIOUS = 1,
+    CLAIM_DELEGATE_CUR = 2,
+    CLAIM_DELEGATE_PREV = 3,
+    CLAIM_FH = 4,
+    CLAIM_DELEG_CUR_FH = 5,
+    CLAIM_DELEG_PREV_FH = 6,
+}
+xdr_enum_serde!(open_claim_type4);
+
+/// open_claim4 union. We fully support CLAIM_NULL (component name).
+/// Other claim types are decoded just enough to stay aligned; the handler
+/// rejects them with NFS4ERR_NOTSUPP.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct open_claim4 {
+    pub claim: open_claim_type4,
+    pub file: component4,                             // CLAIM_NULL
+    pub delegate_type: u32,                           // CLAIM_PREVIOUS (open_delegation_type4)
+    pub delegate_cur: Option<(stateid4, component4)>, // CLAIM_DELEGATE_CUR
+    pub delegate_prev_file: component4,               // CLAIM_DELEGATE_PREV
+}
+impl XDR for open_claim4 {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        self.claim.serialize(dest)?;
+        match self.claim {
+            open_claim_type4::CLAIM_NULL => self.file.serialize(dest)?,
+            open_claim_type4::CLAIM_PREVIOUS => self.delegate_type.serialize(dest)?,
+            open_claim_type4::CLAIM_DELEGATE_CUR => {
+                let (sid, name) = self.delegate_cur.clone().unwrap_or_default();
+                sid.serialize(dest)?;
+                name.serialize(dest)?;
+            },
+            open_claim_type4::CLAIM_DELEGATE_PREV => self.delegate_prev_file.serialize(dest)?,
+            // *_FH variants carry nothing beyond the switch.
+            _ => {},
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        self.claim.deserialize(src)?;
+        match self.claim {
+            open_claim_type4::CLAIM_NULL => self.file.deserialize(src)?,
+            open_claim_type4::CLAIM_PREVIOUS => self.delegate_type.deserialize(src)?,
+            open_claim_type4::CLAIM_DELEGATE_CUR => {
+                let mut sid = stateid4::default();
+                let mut name = component4::default();
+                sid.deserialize(src)?;
+                name.deserialize(src)?;
+                self.delegate_cur = Some((sid, name));
+            },
+            open_claim_type4::CLAIM_DELEGATE_PREV => self.delegate_prev_file.deserialize(src)?,
+            _ => {},
+        }
+        Ok(())
+    }
+}
+
+// open_owner4
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct open_owner4 {
+    pub clientid: clientid4,
+    pub owner: Vec<u8>,
+}
+xdr_struct!(open_owner4, clientid, owner);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OPEN4args {
+    pub seqid: seqid4,
+    pub share_access: u32,
+    pub share_deny: u32,
+    pub owner: open_owner4,
+    pub openhow: openflag4,
+    pub claim: open_claim4,
+}
+xdr_struct!(OPEN4args, seqid, share_access, share_deny, owner, openhow, claim);
+
+// change_info4
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct change_info4 {
+    pub atomic: bool,
+    pub before: changeid4,
+    pub after: changeid4,
+}
+xdr_struct!(change_info4, atomic, before, after);
+
+// open_delegation4 — we always emit OPEN_DELEGATE_NONE (0).
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct open_delegation4_none;
+impl XDR for open_delegation4_none {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        0u32.serialize(dest) // OPEN_DELEGATE_NONE
+    }
+    fn deserialize<R: Read>(&mut self, _src: &mut R) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct OPEN4resok {
+    pub stateid: stateid4,
+    pub cinfo: change_info4,
+    pub rflags: u32,
+    pub attrset: bitmap4,
+    pub delegation: open_delegation4_none,
+}
+xdr_struct!(OPEN4resok, stateid, cinfo, rflags, attrset, delegation);
+
+// ---- CLOSE (RFC 8881 §18.2) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CLOSE4args {
+    pub seqid: seqid4,
+    pub open_stateid: stateid4,
+}
+xdr_struct!(CLOSE4args, seqid, open_stateid);
+
+// ---- READ (RFC 8881 §18.22) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct READ4args {
+    pub stateid: stateid4,
+    pub offset: offset4,
+    pub count: count4,
+}
+xdr_struct!(READ4args, stateid, offset, count);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct READ4resok {
+    pub eof: bool,
+    pub data: Vec<u8>,
+}
+xdr_struct!(READ4resok, eof, data);
+
+// ---- WRITE (RFC 8881 §18.32) ----
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+pub enum stable_how4 {
+    #[default]
+    UNSTABLE4 = 0,
+    DATA_SYNC4 = 1,
+    FILE_SYNC4 = 2,
+}
+xdr_enum_serde!(stable_how4);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WRITE4args {
+    pub stateid: stateid4,
+    pub offset: offset4,
+    pub stable: stable_how4,
+    pub data: Vec<u8>,
+}
+xdr_struct!(WRITE4args, stateid, offset, stable, data);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct WRITE4resok {
+    pub count: count4,
+    pub committed: stable_how4,
+    pub writeverf: verifier4,
+}
+xdr_struct!(WRITE4resok, count, committed, writeverf);
+
+// ---- REMOVE (RFC 8881 §18.25) ----
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct REMOVE4args {
+    pub target: component4,
+}
+xdr_struct!(REMOVE4args, target);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct REMOVE4resok {
+    pub cinfo: change_info4,
+}
+xdr_struct!(REMOVE4resok, cinfo);
+
+// ---- CREATE (RFC 8881 §18.4) ----
+
+/// createtype4 union switched on ftype4.
+/// We support NF4DIR (void) and NF4LNK (linktext). BLK/CHR carry specdata4;
+/// SOCK/FIFO are void. We decode all variants to stay aligned but only act
+/// on DIR and LNK.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct createtype4 {
+    pub ftype: ftype4,
+    pub linkdata: linktext4, // NF4LNK
+    pub devdata: specdata4,  // NF4BLK / NF4CHR
+}
+impl XDR for createtype4 {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        self.ftype.serialize(dest)?;
+        match self.ftype {
+            ftype4::NF4LNK => self.linkdata.serialize(dest)?,
+            ftype4::NF4BLK | ftype4::NF4CHR => self.devdata.serialize(dest)?,
+            _ => {},
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        self.ftype.deserialize(src)?;
+        match self.ftype {
+            ftype4::NF4LNK => self.linkdata.deserialize(src)?,
+            ftype4::NF4BLK | ftype4::NF4CHR => self.devdata.deserialize(src)?,
+            _ => {},
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CREATE4args {
+    pub objtype: createtype4,
+    pub objname: component4,
+    pub createattrs: fattr4,
+}
+xdr_struct!(CREATE4args, objtype, objname, createattrs);
+
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct CREATE4resok {
+    pub cinfo: change_info4,
+    pub attrset: bitmap4,
+}
+xdr_struct!(CREATE4resok, cinfo, attrset);
+
+// ---- RENAME (RFC 8881 §18.26) ----
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct RENAME4args {
+    pub oldname: component4,
+    pub newname: component4,
+}
+xdr_struct!(RENAME4args, oldname, newname);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RENAME4resok {
+    pub source_cinfo: change_info4,
+    pub target_cinfo: change_info4,
+}
+xdr_struct!(RENAME4resok, source_cinfo, target_cinfo);
+
+// ---- RECLAIM_COMPLETE (RFC 8881 §18.51) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RECLAIM_COMPLETE4args {
+    pub rca_one_fs: bool,
+}
+xdr_struct!(RECLAIM_COMPLETE4args, rca_one_fs);
+
+// ---- SECINFO / SECINFO_NO_NAME (RFC 8881 §18.29, §18.45) ----
+
+// RPC auth flavors
+pub const AUTH_NONE: u32 = 0;
+pub const AUTH_SYS: u32 = 1;
+pub const RPCSEC_GSS: u32 = 6;
+
+pub type sec_oid4 = Vec<u8>; // opaque<>
+
+/// rpc_gss_svc_t (RFC 2203 / RFC 8881 §18.29).
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+pub enum rpc_gss_svc_t {
+    #[default]
+    RPC_GSS_SVC_NONE = 1,
+    RPC_GSS_SVC_INTEGRITY = 2,
+    RPC_GSS_SVC_PRIVACY = 3,
+}
+xdr_enum_serde!(rpc_gss_svc_t);
+
+/// rpcsec_gss_info (RFC 8881 §18.29).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct rpcsec_gss_info {
+    pub oid: sec_oid4,
+    pub qop: qop4,
+    pub service: rpc_gss_svc_t,
+}
+xdr_struct!(rpcsec_gss_info, oid, qop, service);
+
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+pub enum secinfo_style4 {
+    #[default]
+    SECINFO_STYLE4_CURRENT_FH = 0,
+    SECINFO_STYLE4_PARENT = 1,
+}
+xdr_enum_serde!(secinfo_style4);
+
+/// secinfo4 union switched on flavor (RFC 8881 §18.29).
+/// AUTH_NONE / AUTH_SYS carry no body; RPCSEC_GSS carries rpcsec_gss_info.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct secinfo4 {
+    pub flavor: u32,
+    /// Present iff flavor == RPCSEC_GSS.
+    pub gss_info: Option<rpcsec_gss_info>,
+}
+impl XDR for secinfo4 {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        self.flavor.serialize(dest)?;
+        if self.flavor == RPCSEC_GSS {
+            // A malformed value (flavor==GSS but None) would desync the
+            // stream; encode a default to stay aligned rather than panic.
+            self.gss_info.clone().unwrap_or_default().serialize(dest)?;
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        self.flavor.deserialize(src)?;
+        if self.flavor == RPCSEC_GSS {
+            let mut info = rpcsec_gss_info::default();
+            info.deserialize(src)?;
+            self.gss_info = Some(info);
+        } else {
+            self.gss_info = None;
+        }
+        Ok(())
+    }
+}
+
+impl XDR for Vec<secinfo4> {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        (self.len() as u32).serialize(dest)?;
+        for e in self {
+            e.serialize(dest)?;
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        let mut n = 0u32;
+        n.deserialize(src)?;
+        self.clear();
+        for _ in 0..n {
+            let mut e = secinfo4::default();
+            e.deserialize(src)?;
+            self.push(e);
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SECINFO_NO_NAME4args {
+    pub style: secinfo_style4,
+}
+xdr_struct!(SECINFO_NO_NAME4args, style);
+
+/// SECINFO4resok = secinfo4<>  (shared by SECINFO and SECINFO_NO_NAME).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SECINFO4resok {
+    pub flavors: Vec<secinfo4>,
+}
+xdr_struct!(SECINFO4resok, flavors);
+
+// ---- READLINK (RFC 8881 §18.24) ----
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct READLINK4resok {
+    pub link: linktext4,
+}
+xdr_struct!(READLINK4resok, link);
+
+// ---- COMMIT (RFC 8881 §18.3) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct COMMIT4args {
+    pub offset: offset4,
+    pub count: count4,
+}
+xdr_struct!(COMMIT4args, offset, count);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct COMMIT4resok {
+    pub writeverf: verifier4,
+}
+xdr_struct!(COMMIT4resok, writeverf);

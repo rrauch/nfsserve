@@ -14,14 +14,8 @@ use crate::xdr::*;
 
 /// Per-COMPOUND execution state.
 struct CompoundState {
-    // Current / saved filehandle (RFC 8881 §16.2). Ops like PUTFH/GETFH/
-    // LOOKUP operate on these. None => NFS4ERR_NOFILEHANDLE.
     current_fh: Option<nfs_fh4>,
     saved_fh: Option<nfs_fh4>,
-
-    // Set once SEQUENCE runs. Binds this compound to a session + slot.
-    // None until SEQUENCE succeeds; most ops require it (else
-    // NFS4ERR_OP_NOT_IN_SESSION for the first non-SEQUENCE op).
     session: Option<SequenceContext>,
     opcount: usize,
 }
@@ -35,6 +29,23 @@ impl CompoundState {
             opcount: 0,
         }
     }
+
+    /// Every non-SEQUENCE op requires a bound session.
+    fn require_session(&self) -> Result<(), OpError> {
+        if self.session.is_none() {
+            Err(nfsstat4::NFS4ERR_OP_NOT_IN_SESSION.into())
+        } else {
+            Ok(())
+        }
+    }
+
+    fn current_fh(&self) -> Result<&nfs_fh4, OpError> {
+        self.current_fh.as_ref().ok_or(nfsstat4::NFS4ERR_NOFILEHANDLE.into())
+    }
+
+    fn saved_fh(&self) -> Result<&nfs_fh4, OpError> {
+        self.saved_fh.as_ref().ok_or(nfsstat4::NFS4ERR_NOFILEHANDLE.into())
+    }
 }
 
 struct SequenceContext {
@@ -43,6 +54,147 @@ struct SequenceContext {
     sequenceid: sequenceid4,
     cache_this: bool,
 }
+
+enum OpError {
+    Status(nfsstat4),
+    Fatal(anyhow::Error),
+}
+
+impl From<nfsstat4> for OpError {
+    fn from(s: nfsstat4) -> Self {
+        OpError::Status(s)
+    }
+}
+
+impl From<anyhow::Error> for OpError {
+    fn from(e: anyhow::Error) -> Self {
+        OpError::Fatal(e)
+    }
+}
+
+impl From<std::io::Error> for OpError {
+    fn from(value: std::io::Error) -> Self {
+        anyhow::Error::from(value).into()
+    }
+}
+
+impl From<crate::nfs3::nfsstat3> for OpError {
+    fn from(e: crate::nfs3::nfsstat3) -> Self {
+        OpError::Status(nfsstat4::from(e))
+    }
+}
+
+/// Assert `attr.ftype` is `$want`, else return `$otherwise`.
+/// Also encodes the common NF4DIR special-case for regular-file ops.
+macro_rules! ensure_ftype {
+    ($attr:expr, $want:path, $otherwise:expr) => {{
+        match $attr.ftype {
+            Some($want) => {},
+            other => {
+                let _ = other;
+                return Err($otherwise.into());
+            },
+        }
+    }};
+}
+
+// ---------------------------------------------------------------------------
+// VFS helpers (map errors to OpError, fold in the common ftype checks).
+// ---------------------------------------------------------------------------
+
+fn fh_to_id(context: &RPCContext, fh: &nfs_fh4) -> Result<fileid4, OpError> {
+    Ok(context.vfs.fh_to_id(fh)?)
+}
+
+async fn getattr4(context: &RPCContext, id: fileid4) -> Result<fattr4, OpError> {
+    let a = context.vfs.getattr(id).await?;
+    Ok(fattr4::from_fattr3(&a))
+}
+
+/// getattr + assert directory; returns the fattr4 (for change-id extraction).
+async fn require_dir(context: &RPCContext, id: fileid4) -> Result<fattr4, OpError> {
+    let a = getattr4(context, id).await?;
+    ensure_ftype!(a, ftype4::NF4DIR, nfsstat4::NFS4ERR_NOTDIR);
+    Ok(a)
+}
+
+/// getattr + assert regular file (ISDIR / INVAL on mismatch).
+async fn require_reg(context: &RPCContext, id: fileid4) -> Result<(), OpError> {
+    let a = getattr4(context, id).await?;
+    match a.ftype {
+        Some(ftype4::NF4REG) => Ok(()),
+        Some(ftype4::NF4DIR) => Err(nfsstat4::NFS4ERR_ISDIR.into()),
+        _ => Err(nfsstat4::NFS4ERR_INVAL.into()),
+    }
+}
+
+/// getattr + assert symlink (ISDIR / INVAL on mismatch).
+async fn require_symlink(context: &RPCContext, id: fileid4) -> Result<(), OpError> {
+    let a = getattr4(context, id).await?;
+    match a.ftype {
+        Some(ftype4::NF4LNK) => Ok(()),
+        Some(ftype4::NF4DIR) => Err(nfsstat4::NFS4ERR_ISDIR.into()),
+        _ => Err(nfsstat4::NFS4ERR_INVAL.into()),
+    }
+}
+
+fn require_writable(context: &RPCContext) -> Result<(), OpError> {
+    if matches!(context.vfs.capabilities(), crate::vfs::VFSCapabilities::ReadOnly) {
+        Err(nfsstat4::NFS4ERR_ROFS.into())
+    } else {
+        Ok(())
+    }
+}
+
+fn change_before(attr: &fattr4) -> changeid4 {
+    attr.change.unwrap_or_default()
+}
+
+async fn change_after(context: &RPCContext, id: fileid4, fallback: changeid4) -> changeid4 {
+    context
+        .vfs
+        .getattr(id)
+        .await
+        .map(|a| a.ctime.seconds as changeid4)
+        .unwrap_or(fallback)
+}
+
+/// Which access bit a stateid must carry.
+#[derive(Clone, Copy)]
+enum Need {
+    Read,
+    Write,
+}
+
+/// Validate a stateid against the current file: special stateids are always
+/// allowed; open stateids must match the file and carry the needed access.
+fn check_stateid(context: &RPCContext, stateid: &stateid4, fileid: fileid4, need: Need) -> Result<(), OpError> {
+    use crate::nfs4_state::ResolveStateid;
+    match context.nfs4_state.resolve_stateid(stateid) {
+        ResolveStateid::Special => Ok(()),
+        ResolveStateid::Open {
+            fileid: sid_fileid,
+            share_access,
+        } => {
+            if sid_fileid != fileid {
+                return Err(nfsstat4::NFS4ERR_BAD_STATEID.into());
+            }
+            let bit = match need {
+                Need::Read => OPEN4_SHARE_ACCESS_READ,
+                Need::Write => OPEN4_SHARE_ACCESS_WRITE,
+            };
+            if share_access & bit == 0 {
+                return Err(nfsstat4::NFS4ERR_OPENMODE.into());
+            }
+            Ok(())
+        },
+        ResolveStateid::Bad => Err(nfsstat4::NFS4ERR_BAD_STATEID.into()),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Top-level dispatch.
+// ---------------------------------------------------------------------------
 
 pub async fn handle_nfs(
     xid: u32,
@@ -85,8 +237,7 @@ async fn nfsproc4_compound(
     output: &mut impl Write,
     context: &RPCContext,
 ) -> Result<(), anyhow::Error> {
-    // ---- decode COMPOUND4args header ----
-    let mut tag = crate::nfs::nfsstring::default();
+    let mut tag = nfsstring::default();
     tag.deserialize(input)?;
     let mut minorversion: u32 = 0;
     minorversion.deserialize(input)?;
@@ -95,12 +246,11 @@ async fn nfsproc4_compound(
 
     debug!("nfs4 COMPOUND xid={} tag={:?} minor={} nops={}", xid, tag, minorversion, num_ops);
 
-    // Reject anything but 4.1
     if minorversion != 1 {
         make_success_reply(xid).serialize(output)?;
         nfsstat4::NFS4ERR_MINOR_VERS_MISMATCH.serialize(output)?;
         tag.serialize(output)?;
-        0u32.serialize(output)?; // empty resarray
+        0u32.serialize(output)?;
         return Ok(());
     }
 
@@ -110,19 +260,16 @@ async fn nfsproc4_compound(
     let mut last_status = nfsstat4::NFS4_OK;
 
     for _ in 0..num_ops {
-        // each nfs_argop4 begins with the opnum
         let mut opnum_raw: u32 = 0;
         opnum_raw.deserialize(input)?;
 
         let mut op_out = Cursor::new(Vec::<u8>::new());
-        // echo the opnum into the result (nfs_resop4 also starts with opnum)
         opnum_raw.serialize(&mut op_out)?;
 
         let dispatch = match nfs_opnum4::from_u32(opnum_raw) {
             Some(op) => dispatch_op(op, input, &mut op_out, &mut state, context).await?,
             None => {
                 warn!("nfs4: illegal/unknown opnum {}", opnum_raw);
-                // Re-encode as OP_ILLEGAL result.
                 let mut illegal = Cursor::new(Vec::<u8>::new());
                 nfs_opnum4::OP_ILLEGAL.serialize(&mut illegal)?;
                 nfsstat4::NFS4ERR_OP_ILLEGAL.serialize(&mut illegal)?;
@@ -131,10 +278,7 @@ async fn nfsproc4_compound(
             },
         };
 
-        // Handle SEQUENCE replay: abort normal assembly, emit cached bytes.
         if let DispatchResult::Replay(cached) = dispatch {
-            // The cached bytes are a full COMPOUND4res body
-            // (status + tag + resarray). Emit verbatim.
             make_success_reply(xid).serialize(output)?;
             output.write_all(&cached)?;
             return Ok(());
@@ -147,20 +291,17 @@ async fn nfsproc4_compound(
         last_status = status;
         state.opcount += 1;
 
-        // COMPOUND stops at first error
         if status != nfsstat4::NFS4_OK {
             break;
         }
     }
 
-    // Assemble the full COMPOUND4res body.
     let mut body: Vec<u8> = Vec::new();
     last_status.serialize(&mut body)?;
     tag.serialize(&mut body)?;
     rescount.serialize(&mut body)?;
     body.extend_from_slice(&result_buf);
 
-    // If this compound ran under SEQUENCE with sa_cachethis, cache the body.
     if let Some(seq) = &state.session {
         if seq.cache_this {
             context
@@ -176,7 +317,6 @@ async fn nfsproc4_compound(
 
 enum DispatchResult {
     Status(nfsstat4),
-    /// SEQUENCE detected a replay; carries the cached COMPOUND4res body.
     Replay(Vec<u8>),
 }
 
@@ -199,33 +339,59 @@ async fn dispatch_op(
     context: &RPCContext,
 ) -> Result<DispatchResult, anyhow::Error> {
     use nfs_opnum4::*;
-    match op {
-        OP_EXCHANGE_ID => op_exchange_id(input, op_out, context).await.map(DispatchResult::Status),
-        OP_CREATE_SESSION => op_create_session(input, op_out, context).await.map(DispatchResult::Status),
-        OP_DESTROY_SESSION => op_destroy_session(input, op_out, state, context)
-            .await
-            .map(DispatchResult::Status),
-        OP_DESTROY_CLIENTID => op_destroy_clientid(input, op_out, context).await.map(DispatchResult::Status),
-        OP_SEQUENCE => op_sequence(input, op_out, state, context).await,
+
+    macro_rules! run {
+        ($fut:expr) => {
+            match $fut.await {
+                Ok(()) => DispatchResult::Status(nfsstat4::NFS4_OK),
+                Err(OpError::Status(s)) => {
+                    s.serialize(op_out)?;
+                    DispatchResult::Status(s)
+                },
+                Err(OpError::Fatal(e)) => return Err(e),
+            }
+        };
+    }
+
+    let res = match op {
+        OP_EXCHANGE_ID => run!(op_exchange_id(input, op_out, context)),
+        OP_CREATE_SESSION => run!(op_create_session(input, op_out, context)),
+        OP_DESTROY_SESSION => run!(op_destroy_session(input, op_out, state, context)),
+        OP_DESTROY_CLIENTID => run!(op_destroy_clientid(input, op_out, context)),
+        OP_SEQUENCE => op_sequence(input, op_out, state, context).await?,
+        OP_RECLAIM_COMPLETE => run!(op_reclaim_complete(input, op_out, state, context)),
+        OP_SECINFO_NO_NAME => run!(op_secinfo_no_name(input, op_out, state, context)),
+        OP_PUTROOTFH => run!(op_putrootfh(op_out, state, context)),
+        OP_GETFH => run!(op_getfh(op_out, state)),
+        OP_GETATTR => run!(op_getattr(input, op_out, state, context)),
+        OP_PUTFH => run!(op_putfh(input, op_out, state, context)),
+        OP_ACCESS => run!(op_access(input, op_out, state, context)),
+        OP_LOOKUP => run!(op_lookup(input, op_out, state, context)),
+        OP_READDIR => run!(op_readdir(input, op_out, state, context)),
+        OP_OPEN => run!(op_open(input, op_out, state, context)),
+        OP_CLOSE => run!(op_close(input, op_out, state, context)),
+        OP_READ => run!(op_read(input, op_out, state, context)),
+        OP_WRITE => run!(op_write(input, op_out, state, context)),
+        OP_REMOVE => run!(op_remove(input, op_out, state, context)),
+        OP_CREATE => run!(op_create(input, op_out, state, context)),
+        OP_SAVEFH => run!(op_savefh(op_out, state)),
+        OP_RESTOREFH => run!(op_restorefh(op_out, state)),
+        OP_RENAME => run!(op_rename(input, op_out, state, context)),
+        OP_SETATTR => op_setattr(input, op_out, state, context).await.map(DispatchResult::Status)?,
+        OP_READLINK => run!(op_readlink(op_out, state, context)),
+        OP_COMMIT => run!(op_commit(input, op_out, state, context)),
         other => {
             warn!("nfs4: unimplemented op {:?}", other);
-            // NOTE: we have NOT decoded this op's args, so the input
-            // stream is now misaligned. Returning here is only safe if
-            // this is the LAST op or the client sent it standalone.
-            // For a skeleton this is acceptable; fill in ops before use.
             nfsstat4::NFS4ERR_NOTSUPP.serialize(op_out)?;
-            Ok(DispatchResult::Status(nfsstat4::NFS4ERR_NOTSUPP))
+            DispatchResult::Status(nfsstat4::NFS4ERR_NOTSUPP)
         },
-    }
+    };
+    Ok(res)
 }
 
 /// OP_EXCHANGE_ID (RFC 8881 §18.35).
 /// SP4_NONE only, non-pNFS
-async fn op_exchange_id(
-    input: &mut impl Read,
-    op_out: &mut impl Write,
-    context: &RPCContext,
-) -> Result<nfsstat4, anyhow::Error> {
+async fn op_exchange_id(input: &mut impl Read, op_out: &mut impl Write, context: &RPCContext) -> Result<(), OpError> {
     let mut args = EXCHANGE_ID4args::default();
     args.deserialize(input)?;
 
@@ -236,10 +402,8 @@ async fn op_exchange_id(
         args.eia_state_protect.spa_how
     );
 
-    // We only support SP4_NONE.
     if args.eia_state_protect.spa_how != state_protect_how4::SP4_NONE {
-        nfsstat4::NFS4ERR_NOTSUPP.serialize(op_out)?;
-        return Ok(nfsstat4::NFS4ERR_NOTSUPP);
+        return Err(nfsstat4::NFS4ERR_NOTSUPP.into());
     }
 
     let res = context
@@ -263,16 +427,16 @@ async fn op_exchange_id(
 
     nfsstat4::NFS4_OK.serialize(op_out)?;
     resok.serialize(op_out)?;
-    Ok(nfsstat4::NFS4_OK)
+    Ok(())
 }
 
 /// OP_CREATE_SESSION (RFC 8881 §18.36).
-/// Lean impl: single-slot fore channel, no back channel, no persistence.
+/// single-slot fore channel, no back channel, no persistence.
 async fn op_create_session(
     input: &mut impl Read,
     op_out: &mut impl Write,
     context: &RPCContext,
-) -> Result<nfsstat4, anyhow::Error> {
+) -> Result<(), OpError> {
     let mut args = CREATE_SESSION4args::default();
     args.deserialize(input)?;
 
@@ -289,10 +453,7 @@ async fn op_create_session(
         args.csa_cb_program,
     );
 
-    // Negotiate fore channel: clamp to our minimal capabilities.
-    // Single slot => ca_maxrequests = 1. Reply cache size must accommodate
-    // one cached reply per slot.
-    const MAX_REQUEST_SIZE: u32 = 1 << 20; // 1 MiB
+    const MAX_REQUEST_SIZE: u32 = 1 << 20;
     const MAX_RESPONSE_SIZE: u32 = 1 << 20;
     const MAX_OPS: u32 = 8;
     const MAX_REQUESTS: u32 = 1;
@@ -307,8 +468,6 @@ async fn op_create_session(
         ca_rdma_ird: Vec::new(),
     };
 
-    // Back channel: we grant no delegations/callbacks. Advertise a
-    // degenerate back channel and clear CONN_BACK_CHAN in csr_flags.
     let back = channel_attrs4 {
         ca_headerpadsize: 0,
         ca_maxrequestsize: 0,
@@ -322,36 +481,29 @@ async fn op_create_session(
     let num_slots = fore.ca_maxrequests;
 
     use crate::nfs4_state::CreateSessionOutcome::*;
-    let (sessionid, status) = match context.nfs4_state.create_session(
+    let sessionid = match context.nfs4_state.create_session(
         args.csa_clientid,
         args.csa_sequence,
         num_slots,
         fore.clone(),
         back.clone(),
     ) {
-        Ok { sessionid } => (sessionid, nfsstat4::NFS4_OK),
-        Replay { sessionid } => (sessionid, nfsstat4::NFS4_OK),
-        StaleClientId => {
-            nfsstat4::NFS4ERR_STALE_CLIENTID.serialize(op_out)?;
-            return Ok(nfsstat4::NFS4ERR_STALE_CLIENTID);
-        },
-        SeqMisordered => {
-            nfsstat4::NFS4ERR_SEQ_MISORDERED.serialize(op_out)?;
-            return Ok(nfsstat4::NFS4ERR_SEQ_MISORDERED);
-        },
+        Ok { sessionid } | Replay { sessionid } => sessionid,
+        StaleClientId => return Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
+        SeqMisordered => return Err(nfsstat4::NFS4ERR_SEQ_MISORDERED.into()),
     };
 
     let resok = CREATE_SESSION4resok {
         csr_sessionid: sessionid,
         csr_sequence: args.csa_sequence,
-        csr_flags: 0, // no PERSIST, no CONN_BACK_CHAN, no RDMA
+        csr_flags: 0,
         csr_fore_chan_attrs: fore,
         csr_back_chan_attrs: back,
     };
 
-    status.serialize(op_out)?;
+    nfsstat4::NFS4_OK.serialize(op_out)?;
     resok.serialize(op_out)?;
-    Ok(status)
+    Ok(())
 }
 
 /// OP_DESTROY_SESSION (RFC 8881 §18.37).
@@ -360,7 +512,7 @@ async fn op_destroy_session(
     op_out: &mut impl Write,
     state: &mut CompoundState,
     context: &RPCContext,
-) -> Result<nfsstat4, anyhow::Error> {
+) -> Result<(), OpError> {
     let mut args = DESTROY_SESSION4args::default();
     args.deserialize(input)?;
 
@@ -371,21 +523,16 @@ async fn op_destroy_session(
         .as_ref()
         .map(|s| s.sessionid == args.dsa_sessionid)
         .unwrap_or(false);
-
     if destroying_current {
-        // Prevent the compound loop from caching into a now-dead slot.
         state.session = None;
     }
 
-    let ok = context.nfs4_state.destroy_session(&args.dsa_sessionid);
-    let status = if ok {
-        nfsstat4::NFS4_OK
+    if context.nfs4_state.destroy_session(&args.dsa_sessionid) {
+        nfsstat4::NFS4_OK.serialize(op_out)?;
+        Ok(())
     } else {
-        nfsstat4::NFS4ERR_BADSESSION
-    };
-
-    status.serialize(op_out)?;
-    Ok(status)
+        Err(nfsstat4::NFS4ERR_BADSESSION.into())
+    }
 }
 
 /// OP_DESTROY_CLIENTID (RFC 8881 §18.50).
@@ -393,27 +540,25 @@ async fn op_destroy_clientid(
     input: &mut impl Read,
     op_out: &mut impl Write,
     context: &RPCContext,
-) -> Result<nfsstat4, anyhow::Error> {
+) -> Result<(), OpError> {
     let mut args = DESTROY_CLIENTID4args::default();
     args.deserialize(input)?;
 
     debug!("OP_DESTROY_CLIENTID clientid={:#x}", args.dca_clientid);
 
     use crate::nfs4_state::DestroyClientIdOutcome;
-    let status = match context.nfs4_state.destroy_clientid(args.dca_clientid) {
-        DestroyClientIdOutcome::Ok => nfsstat4::NFS4_OK,
-        DestroyClientIdOutcome::StaleClientId => nfsstat4::NFS4ERR_STALE_CLIENTID,
-        DestroyClientIdOutcome::Busy => nfsstat4::NFS4ERR_CLIENTID_BUSY,
-    };
-
-    status.serialize(op_out)?;
-    Ok(status)
+    match context.nfs4_state.destroy_clientid(args.dca_clientid) {
+        DestroyClientIdOutcome::Ok => {
+            nfsstat4::NFS4_OK.serialize(op_out)?;
+            Ok(())
+        },
+        DestroyClientIdOutcome::StaleClientId => Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
+        DestroyClientIdOutcome::Busy => Err(nfsstat4::NFS4ERR_CLIENTID_BUSY.into()),
+    }
 }
 
-/// OP_SEQUENCE (RFC 8881 §18.46).
-/// Must be the first op in the compound. Establishes session binding,
-/// enforces exactly-once semantics via the per-slot reply cache, and
-/// implicitly renews the lease.
+/// SEQUENCE keeps its native signature: it can return Replay and must
+/// serialize its own error statuses (it runs before the session is bound).
 async fn op_sequence(
     input: &mut impl Read,
     op_out: &mut impl Write,
@@ -428,7 +573,6 @@ async fn op_sequence(
         args.sa_sessionid, args.sa_sequenceid, args.sa_slotid, args.sa_highest_slotid, args.sa_cachethis
     );
 
-    // SEQUENCE must be first (NFS4ERR_SEQUENCE_POS).
     if state.opcount != 0 {
         nfsstat4::NFS4ERR_SEQUENCE_POS.serialize(op_out)?;
         return Ok(DispatchResult::Status(nfsstat4::NFS4ERR_SEQUENCE_POS));
@@ -440,10 +584,7 @@ async fn op_sequence(
         .sequence_check(&args.sa_sessionid, args.sa_slotid, args.sa_sequenceid)
     {
         New => nfsstat4::NFS4_OK,
-        Replay(cached) => {
-            // Signal the compound loop to emit the cached reply verbatim.
-            return Ok(DispatchResult::Replay(cached));
-        },
+        Replay(cached) => return Ok(DispatchResult::Replay(cached)),
         RetryUncached => nfsstat4::NFS4ERR_RETRY_UNCACHED_REP,
         Misordered => nfsstat4::NFS4ERR_SEQ_MISORDERED,
         BadSession => nfsstat4::NFS4ERR_BADSESSION,
@@ -455,7 +596,6 @@ async fn op_sequence(
         return Ok(DispatchResult::Status(status));
     }
 
-    // Bind session context for reply caching + later ops.
     state.session = Some(SequenceContext {
         sessionid: args.sa_sessionid,
         slotid: args.sa_slotid,
@@ -475,4 +615,777 @@ async fn op_sequence(
     nfsstat4::NFS4_OK.serialize(op_out)?;
     resok.serialize(op_out)?;
     Ok(DispatchResult::Status(nfsstat4::NFS4_OK))
+}
+
+/// OP_RECLAIM_COMPLETE (RFC 8881 §18.51).
+/// The client has finished (or has no) state to reclaim. Since we hold no
+/// persistent state and grant no delegations, this is an acknowledgement.
+/// We record that reclaim is done so a strict server could reject late
+/// CLAIM_PREVIOUS opens; here it's informational.
+async fn op_reclaim_complete(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = RECLAIM_COMPLETE4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+
+    debug!("OP_RECLAIM_COMPLETE one_fs={}", args.rca_one_fs);
+
+    if let Some(session) = &state.session {
+        context.nfs4_state.set_reclaim_complete(&session.sessionid);
+    }
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_SECINFO_NO_NAME (RFC 8881 §18.45).
+/// Reports supported security flavors. We support AUTH_SYS and AUTH_NONE.
+/// The current filehandle must be set (both styles require it: CURRENT_FH
+/// uses it directly; PARENT requires it to derive the parent).
+async fn op_secinfo_no_name(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = SECINFO_NO_NAME4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    let fh = state.current_fh()?;
+    fh_to_id(context, fh)?; // validate STALE/BADHANDLE
+
+    debug!("OP_SECINFO_NO_NAME style={:?}", args.style);
+
+    let flavors = vec![
+        secinfo4 {
+            flavor: AUTH_SYS,
+            gss_info: None,
+        },
+        secinfo4 {
+            flavor: AUTH_NONE,
+            gss_info: None,
+        },
+    ];
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    flavors.serialize(op_out)?;
+
+    // SECINFO_NO_NAME consumes the current filehandle.
+    state.current_fh = None;
+    Ok(())
+}
+
+/// OP_PUTROOTFH (RFC 8881 §18.21).
+/// Sets the current filehandle to the export root.
+async fn op_putrootfh(op_out: &mut impl Write, state: &mut CompoundState, context: &RPCContext) -> Result<(), OpError> {
+    state.require_session()?;
+
+    let root = context.vfs.root_dir();
+    let fh = context.vfs.id_to_fh(root);
+
+    debug!("OP_PUTROOTFH root_id={} fh={:x?}", root, fh.data);
+
+    state.current_fh = Some(fh);
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
+}
+
+async fn op_getfh(op_out: &mut impl Write, state: &mut CompoundState) -> Result<(), OpError> {
+    state.require_session()?;
+    let fh = state.current_fh()?;
+
+    debug!("OP_GETFH fh={:x?}", fh.data);
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    fh.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_GETATTR (RFC 8881 §18.7).
+async fn op_getattr(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = GETATTR4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    let fh = state.current_fh()?.clone();
+    let id = fh_to_id(context, &fh)?;
+
+    debug!("OP_GETATTR id={} req={:x?}", id, args.attr_request);
+
+    let mut attr = getattr4(context, id).await?;
+    attr.filehandle = Some(fh);
+    attr.retain_requested(&args.attr_request);
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    attr.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_PUTFH (RFC 8881 §18.19).
+/// Sets the current filehandle to the supplied value.
+async fn op_putfh(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = PUTFH4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+
+    debug!("OP_PUTFH fh={:x?}", args.object.data);
+
+    fh_to_id(context, &args.object)?; // validate now
+    state.current_fh = Some(args.object);
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_ACCESS (RFC 8881 §18.1).
+/// Derives granted access from file mode + our export capability.
+/// We do not do per-user permission enforcement here (AUTH_SYS, lean).
+async fn op_access(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = ACCESS4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    let fh = state.current_fh()?;
+    let id = fh_to_id(context, fh)?;
+
+    let attr = getattr4(context, id).await?;
+    let is_dir = matches!(attr.ftype, Some(ftype4::NF4DIR));
+    let read_only = matches!(context.vfs.capabilities(), crate::vfs::VFSCapabilities::ReadOnly);
+
+    let supported = if is_dir {
+        ACCESS4_READ | ACCESS4_LOOKUP | ACCESS4_MODIFY | ACCESS4_EXTEND | ACCESS4_DELETE
+    } else {
+        ACCESS4_READ | ACCESS4_MODIFY | ACCESS4_EXTEND | ACCESS4_EXECUTE
+    };
+
+    let mut granted = supported;
+    if read_only {
+        granted &= !(ACCESS4_MODIFY | ACCESS4_EXTEND | ACCESS4_DELETE);
+    }
+
+    let access = granted & args.access;
+    let supported = supported & args.access;
+
+    debug!("OP_ACCESS id={} req={:#x} supported={:#x} granted={:#x}", id, args.access, supported, access);
+
+    let resok = ACCESS4resok { supported, access };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_LOOKUP (RFC 8881 §18.13).
+/// Resolves `objname` in the current directory FH; on success the current
+/// FH becomes the named object.
+async fn op_lookup(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = LOOKUP4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    if args.objname.0.is_empty() {
+        return Err(nfsstat4::NFS4ERR_INVAL.into());
+    }
+
+    let fh = state.current_fh()?;
+    let dirid = fh_to_id(context, fh)?;
+    require_dir(context, dirid).await?;
+
+    let name: filename4 = args.objname.0.clone().into();
+    debug!("OP_LOOKUP dir={} name={:?}", dirid, args.objname);
+
+    let objid = context.vfs.lookup(dirid, &name).await?;
+    state.current_fh = Some(context.vfs.id_to_fh(objid));
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_READDIR (RFC 8881 §18.23).
+/// Cookie == fileid of last returned entry (0 => from start). No cookie
+/// verifier is used (matches the VFS contract). Honors maxcount as a hard
+/// byte budget on the encoded result.
+async fn op_readdir(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = READDIR4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    let fh = state.current_fh()?;
+    let dirid = fh_to_id(context, fh)?;
+    require_dir(context, dirid).await?;
+
+    if args.maxcount == 0 {
+        return Err(nfsstat4::NFS4ERR_TOOSMALL.into());
+    }
+
+    let start_after = args.cookie;
+    let max_entries = 256usize;
+    let listing = context.vfs.readdir(dirid, start_after, max_entries).await?;
+
+    debug!(
+        "OP_READDIR dir={} cookie={} maxcount={} vfs_entries={} vfs_end={}",
+        dirid,
+        args.cookie,
+        args.maxcount,
+        listing.entries.len(),
+        listing.end
+    );
+
+    let fixed_overhead: usize = 4 + NFS4_VERIFIER_SIZE + 4 + 4;
+    let budget = args.maxcount as usize;
+
+    let mut entries_buf: Vec<u8> = Vec::new();
+    let mut used = fixed_overhead;
+    let mut written_any = false;
+    let mut truncated = false;
+
+    for e in &listing.entries {
+        let mut attr = fattr4::from_fattr3(&e.attr);
+        attr.filehandle = Some(context.vfs.id_to_fh(e.fileid));
+        attr.retain_requested(&args.attr_request);
+
+        let mut ent = Vec::new();
+        true.serialize(&mut ent)?;
+        (e.fileid as nfs_cookie4).serialize(&mut ent)?;
+        let name: nfsstring = e.name.clone().into();
+        name.serialize(&mut ent)?;
+        attr.serialize(&mut ent)?;
+
+        if used + ent.len() > budget {
+            truncated = true;
+            break;
+        }
+        used += ent.len();
+        entries_buf.extend_from_slice(&ent);
+        written_any = true;
+    }
+
+    if !written_any && !listing.entries.is_empty() {
+        return Err(nfsstat4::NFS4ERR_TOOSMALL.into());
+    }
+
+    let eof = listing.end && !truncated;
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    let zero_verf: verifier4 = [0u8; NFS4_VERIFIER_SIZE];
+    zero_verf.serialize(op_out)?;
+    op_out.write_all(&entries_buf)?;
+    false.serialize(op_out)?;
+    eof.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_OPEN (RFC 8881 §18.16).
+/// CLAIM_NULL & CLAIM_FH only, OPEN4_NOCREATE + OPEN4_CREATE/UNCHECKED4,
+/// always-grant shares, never delegates..
+async fn op_open(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = OPEN4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+
+    debug!(
+        "OP_OPEN seqid={} access={:#x} deny={:#x} owner_clientid={:#x} type={:?} claim={:?}",
+        args.seqid, args.share_access, args.share_deny, args.owner.clientid, args.openhow.opentype, args.claim.claim,
+    );
+
+    let acc = args.share_access & OPEN4_SHARE_ACCESS_BOTH;
+    if acc == 0 {
+        return Err(nfsstat4::NFS4ERR_INVAL.into());
+    }
+
+    let read_only = matches!(context.vfs.capabilities(), crate::vfs::VFSCapabilities::ReadOnly);
+    let wants_write = acc & OPEN4_SHARE_ACCESS_WRITE != 0;
+    let creating = args.openhow.opentype == opentype4::OPEN4_CREATE;
+    if read_only && (wants_write || creating) {
+        return Err(nfsstat4::NFS4ERR_ROFS.into());
+    }
+
+    let mut created = false;
+    let mut dir_change_before: changeid4 = 0;
+    let mut dir_change_after: changeid4 = 0;
+
+    let fileid = match args.claim.claim {
+        open_claim_type4::CLAIM_NULL => {
+            let dir_fh = state.current_fh()?;
+            let dirid = fh_to_id(context, dir_fh)?;
+            let dir_attr = require_dir(context, dirid).await?;
+            dir_change_before = change_before(&dir_attr);
+
+            let name: filename4 = args.claim.file.0.clone().into();
+            if name.0.is_empty() {
+                return Err(nfsstat4::NFS4ERR_INVAL.into());
+            }
+
+            let id = match context.vfs.lookup(dirid, &name).await.map_err(nfsstat4::from) {
+                Ok(id) => id,
+                Err(nfsstat4::NFS4ERR_NOENT) if creating => {
+                    let attr = crate::nfs3::sattr3::default();
+                    let (id, _) = context.vfs.create(dirid, &name, attr).await?;
+                    created = true;
+                    id
+                },
+                Err(status) => return Err(status.into()),
+            };
+
+            dir_change_after = if created {
+                change_after(context, dirid, dir_change_before).await
+            } else {
+                dir_change_before
+            };
+            id
+        },
+
+        open_claim_type4::CLAIM_FH => {
+            if creating {
+                return Err(nfsstat4::NFS4ERR_INVAL.into());
+            }
+            let fh = state.current_fh()?;
+            fh_to_id(context, fh)?
+        },
+
+        _ => return Err(nfsstat4::NFS4ERR_NOTSUPP.into()),
+    };
+
+    // Target must be a regular file. (SYMLINK for other non-dir types.)
+    let target_attr = getattr4(context, fileid).await?;
+    match target_attr.ftype {
+        Some(ftype4::NF4REG) => {},
+        Some(ftype4::NF4DIR) => return Err(nfsstat4::NFS4ERR_ISDIR.into()),
+        _ => return Err(nfsstat4::NFS4ERR_SYMLINK.into()),
+    }
+
+    use crate::nfs4_state::OpenOutcome;
+    let stateid = match context.nfs4_state.open(
+        args.owner.clientid,
+        &args.owner.owner,
+        args.seqid,
+        fileid,
+        acc,
+        args.share_deny & OPEN4_SHARE_DENY_BOTH,
+    ) {
+        OpenOutcome::Ok { stateid } => stateid,
+        OpenOutcome::StaleClientId => return Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
+    };
+
+    state.current_fh = Some(context.vfs.id_to_fh(fileid));
+
+    let resok = OPEN4resok {
+        stateid,
+        cinfo: change_info4 {
+            atomic: false,
+            before: dir_change_before,
+            after: dir_change_after,
+        },
+        rflags: 0,
+        attrset: Vec::new(),
+        delegation: open_delegation4_none,
+    };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// CLOSE has a custom error tail (BAD_STATEID with no stateid payload), so it
+/// serializes its own status and always returns Ok(()).
+async fn op_close(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = CLOSE4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    state.current_fh()?; // require FH
+
+    debug!(
+        "OP_CLOSE seqid={} stateid.seqid={} stateid.other={:x?}",
+        args.seqid, args.open_stateid.seqid, args.open_stateid.other
+    );
+
+    use crate::nfs4_state::CloseOutcome;
+    match context.nfs4_state.close(&args.open_stateid) {
+        CloseOutcome::Ok { stateid } => {
+            nfsstat4::NFS4_OK.serialize(op_out)?;
+            stateid.serialize(op_out)?;
+            Ok(())
+        },
+        CloseOutcome::Bad => Err(nfsstat4::NFS4ERR_BAD_STATEID.into()),
+    }
+}
+
+/// OP_READ (RFC 8881 §18.22).
+/// Reads from the current filehandle. The stateid must be a known open
+/// stateid or a special (anonymous) stateid.
+async fn op_read(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = READ4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    let fh = state.current_fh()?;
+    let fh_fileid = fh_to_id(context, fh)?;
+
+    check_stateid(context, &args.stateid, fh_fileid, Need::Read)?;
+
+    debug!("OP_READ id={} offset={} count={}", fh_fileid, args.offset, args.count);
+
+    require_reg(context, fh_fileid).await?;
+
+    let (data, eof) = context.vfs.read(fh_fileid, args.offset, args.count).await?;
+    let resok = READ4resok { eof, data };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_WRITE (RFC 8881 §18.32).
+/// Writes to the current filehandle. Because the VFS write is synchronous
+/// and durable, we always report FILE_SYNC4 (no COMMIT required).
+async fn op_write(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = WRITE4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    let fh = state.current_fh()?;
+    let fh_fileid = fh_to_id(context, fh)?;
+
+    require_writable(context)?;
+    check_stateid(context, &args.stateid, fh_fileid, Need::Write)?;
+    require_reg(context, fh_fileid).await?;
+
+    let write_len = args.data.len();
+    debug!("OP_WRITE id={} offset={} len={} stable={:?}", fh_fileid, args.offset, write_len, args.stable);
+
+    context.vfs.write(fh_fileid, args.offset, &args.data).await?;
+
+    let resok = WRITE4resok {
+        count: write_len as count4,
+        committed: stable_how4::FILE_SYNC4,
+        writeverf: context.nfs4_state.write_verifier(),
+    };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_REMOVE (RFC 8881 §18.25).
+/// Removes `target` from the current directory FH. The VFS `remove`
+/// handles both files and (empty) directories per its contract.
+async fn op_remove(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = REMOVE4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    require_writable(context)?;
+    if args.target.0.is_empty() {
+        return Err(nfsstat4::NFS4ERR_INVAL.into());
+    }
+
+    let dir_fh = state.current_fh()?;
+    let dirid = fh_to_id(context, dir_fh)?;
+    let before = change_before(&require_dir(context, dirid).await?);
+
+    let name: filename4 = args.target.0.clone().into();
+    debug!("OP_REMOVE dir={} name={:?}", dirid, args.target);
+
+    context.vfs.remove(dirid, &name).await?;
+    let after = change_after(context, dirid, before).await;
+
+    let resok = REMOVE4resok {
+        cinfo: change_info4 {
+            atomic: false,
+            before,
+            after,
+        },
+    };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_CREATE (RFC 8881 §18.4).
+/// Creates a NON-regular object in the current directory FH. Regular files
+/// are created via OPEN, not here. We support NF4DIR and NF4LNK; other
+/// types return NFS4ERR_NOTSUPP (the VFS lacks mknod).
+/// On success the current FH becomes the newly created object.
+async fn op_create(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = CREATE4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    require_writable(context)?;
+    if args.objname.0.is_empty() {
+        return Err(nfsstat4::NFS4ERR_INVAL.into());
+    }
+
+    let dir_fh = state.current_fh()?;
+    let dirid = fh_to_id(context, dir_fh)?;
+    let before = change_before(&require_dir(context, dirid).await?);
+
+    let name: filename4 = args.objname.0.clone().into();
+    debug!("OP_CREATE dir={} name={:?} type={:?}", dirid, args.objname, args.objtype.ftype);
+
+    let new_id: fileid4 = match args.objtype.ftype {
+        ftype4::NF4DIR => context.vfs.mkdir(dirid, &name).await?.0,
+        ftype4::NF4LNK => {
+            let target: nfspath4 = args.objtype.linkdata.0.clone().into();
+            let attr = crate::nfs3::sattr3::default();
+            context.vfs.symlink(dirid, &name, &target, &attr).await?.0
+        },
+        _ => return Err(nfsstat4::NFS4ERR_NOTSUPP.into()),
+    };
+
+    state.current_fh = Some(context.vfs.id_to_fh(new_id));
+    let after = change_after(context, dirid, before).await;
+
+    let resok = CREATE4resok {
+        cinfo: change_info4 {
+            atomic: false,
+            before,
+            after,
+        },
+        attrset: Vec::new(),
+    };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+async fn op_savefh(op_out: &mut impl Write, state: &mut CompoundState) -> Result<(), OpError> {
+    state.require_session()?;
+    let fh = state.current_fh()?.clone();
+    state.saved_fh = Some(fh);
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_RESTOREFH (RFC 8881 §18.27).
+/// Copies the saved filehandle into the current filehandle.
+async fn op_restorefh(op_out: &mut impl Write, state: &mut CompoundState) -> Result<(), OpError> {
+    state.require_session()?;
+    let fh = state.saved_fh.clone().ok_or(OpError::Status(nfsstat4::NFS4ERR_RESTOREFH))?;
+    state.current_fh = Some(fh);
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_RENAME (RFC 8881 §18.26).
+/// Source dir = SAVED filehandle, target dir = CURRENT filehandle.
+async fn op_rename(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = RENAME4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    require_writable(context)?;
+    if args.oldname.0.is_empty() || args.newname.0.is_empty() {
+        return Err(nfsstat4::NFS4ERR_INVAL.into());
+    }
+
+    let from_dirid = fh_to_id(context, state.saved_fh()?)?;
+    let to_dirid = fh_to_id(context, state.current_fh()?)?;
+
+    let src_before = change_before(&require_dir(context, from_dirid).await?);
+    let tgt_before = change_before(&require_dir(context, to_dirid).await?);
+
+    let oldname: filename4 = args.oldname.0.clone().into();
+    let newname: filename4 = args.newname.0.clone().into();
+
+    debug!(
+        "OP_RENAME from_dir={} old={:?} to_dir={} new={:?}",
+        from_dirid, args.oldname, to_dirid, args.newname
+    );
+
+    context.vfs.rename(from_dirid, &oldname, to_dirid, &newname).await?;
+
+    let src_after = change_after(context, from_dirid, src_before).await;
+    let tgt_after = change_after(context, to_dirid, tgt_before).await;
+
+    let resok = RENAME4resok {
+        source_cinfo: change_info4 {
+            atomic: false,
+            before: src_before,
+            after: src_after,
+        },
+        target_cinfo: change_info4 {
+            atomic: false,
+            before: tgt_before,
+            after: tgt_after,
+        },
+    };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_SETATTR (RFC 8881 §18.30).
+/// Self-serializing: `attrsset` always follows the status, so this op emits
+/// its own status + bitmap in every path and returns the status directly.
+async fn op_setattr<R: Read, W: Write>(
+    input: &mut R,
+    op_out: &mut W,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<nfsstat4, anyhow::Error> {
+    let mut stateid = stateid4::default();
+    let mut attrs = fattr4::default();
+    stateid.deserialize(input)?;
+    attrs.deserialize(input)?;
+
+    let empty = bitmap4::new();
+
+    // Fallible core: returns the set bitmap on success, or a status to emit
+    // (with an empty bitmap) on failure.
+    let core = async {
+        state.require_session()?;
+        require_writable(context)?;
+
+        let fileid = fh_to_id(context, state.current_fh()?)?;
+
+        if attrs.size.is_some() {
+            check_stateid(context, &stateid, fileid, Need::Write)?;
+        }
+
+        let (sattr, set_bits) = attrs
+            .to_sattr3()
+            .map_err(|_bit| OpError::Status(nfsstat4::NFS4ERR_ATTRNOTSUPP))?;
+
+        debug!("OP_SETATTR id={} set_bits={:x?}", fileid, set_bits);
+
+        context.vfs.setattr(fileid, sattr).await?;
+        Ok::<bitmap4, OpError>(set_bits)
+    };
+
+    match core.await {
+        Ok(set_bits) => {
+            nfsstat4::NFS4_OK.serialize(op_out)?;
+            set_bits.serialize(op_out)?;
+            Ok(nfsstat4::NFS4_OK)
+        },
+        Err(OpError::Status(s)) => {
+            s.serialize(op_out)?;
+            empty.serialize(op_out)?;
+            Ok(s)
+        },
+        Err(OpError::Fatal(e)) => Err(e),
+    }
+}
+
+/// OP_READLINK (RFC 8881 §18.24).
+/// Returns the target path of the symlink at the current FH.
+async fn op_readlink(op_out: &mut impl Write, state: &mut CompoundState, context: &RPCContext) -> Result<(), OpError> {
+    state.require_session()?;
+    let fh = state.current_fh()?;
+    let id = fh_to_id(context, fh)?;
+
+    require_symlink(context, id).await?;
+
+    debug!("OP_READLINK id={}", id);
+
+    let target = context.vfs.readlink(id).await?;
+    let resok = READLINK4resok { link: target };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_COMMIT (RFC 8881 §18.3).
+/// Our WRITE always reports FILE_SYNC4 (data is durable on return), so
+/// there is nothing to flush. We validate the current FH is a regular file
+/// and return the stable write verifier.
+async fn op_commit(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = COMMIT4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    let fh = state.current_fh()?;
+    let fileid = fh_to_id(context, fh)?;
+
+    require_reg(context, fileid).await?;
+
+    debug!("OP_COMMIT id={} offset={} count={}", fileid, args.offset, args.count);
+
+    let resok = COMMIT4resok {
+        writeverf: context.nfs4_state.write_verifier(),
+    };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
 }

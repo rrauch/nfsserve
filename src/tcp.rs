@@ -11,6 +11,7 @@ use tokio::sync::mpsc;
 use tracing::{debug, error, info};
 
 use crate::context::RPCContext;
+use crate::nfs4::NFS4_LEASE_TIME;
 use crate::nfs4_state::NFS4State;
 use crate::rpcwire::*;
 use crate::transaction_tracker::TransactionTracker;
@@ -161,7 +162,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
-            nfs4_state: Arc::new(NFS4State::new(Duration::from_secs(90))),
+            nfs4_state: Arc::new(NFS4State::new(Duration::from_secs((NFS4_LEASE_TIME as u64 * 2) + 1))),
         })
     }
 
