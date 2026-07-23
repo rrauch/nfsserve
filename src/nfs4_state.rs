@@ -27,6 +27,8 @@ struct OpenState {
     seqid: u32,
     share_access: u32,
     share_deny: u32,
+    /// Number of outstanding OPENs collapsed into this state.
+    open_count: u32,
 }
 
 #[derive(Default)]
@@ -409,8 +411,6 @@ impl NFS4State {
         }
     }
 
-    /// Record a new open. Always grants (no conflict checking).
-    /// Returns a freshly minted stateid.
     pub fn open(
         &self,
         clientid: clientid4,
@@ -421,14 +421,27 @@ impl NFS4State {
         share_deny: u32,
     ) -> OpenOutcome {
         let mut g = self.inner.lock().unwrap();
-
-        // Client must exist/be confirmed.
         if !g.clientid_index.contains_key(&clientid) {
             return OpenOutcome::StaleClientId;
         }
-
-        // Track the open_owner seqid (recorded, not strictly enforced in 4.1).
         g.open_owners.entry((clientid, owner.to_vec())).or_default().last_seqid = owner_seqid;
+
+        if let Some((other, o)) = g
+            .opens
+            .iter_mut()
+            .find(|(_, o)| o.clientid == clientid && o.owner == owner && o.fileid == fileid)
+        {
+            o.seqid = o.seqid.wrapping_add(1);
+            o.share_access |= share_access;
+            o.share_deny |= share_deny;
+            o.open_count += 1;
+            return OpenOutcome::Ok {
+                stateid: stateid4 {
+                    seqid: o.seqid,
+                    other: *other,
+                },
+            };
+        }
 
         let other = g.fresh_stateid_other();
         g.opens.insert(
@@ -440,9 +453,9 @@ impl NFS4State {
                 seqid: 1,
                 share_access,
                 share_deny,
+                open_count: 1,
             },
         );
-
         OpenOutcome::Ok {
             stateid: stateid4 { seqid: 1, other },
         }
@@ -468,18 +481,24 @@ impl NFS4State {
         }
     }
 
-    /// CLOSE: remove the open state. Returns the bumped stateid on success.
+    /// CLOSE (RFC 8881 §18.2). Bumps the stateid seqid and drops one open
+    /// reference. The open state is only removed once the last reference closes.
+    /// The returned stateid must carry the bumped seqid with the same `other`
+    /// (the "close stateid").
     pub fn close(&self, sid: &stateid4) -> CloseOutcome {
         let mut g = self.inner.lock().unwrap();
-        match g.opens.remove(&sid.other) {
-            Some(mut o) => {
+        match g.opens.get_mut(&sid.other) {
+            Some(o) => {
                 o.seqid = o.seqid.wrapping_add(1);
-                CloseOutcome::Ok {
-                    stateid: stateid4 {
-                        seqid: o.seqid,
-                        other: sid.other,
-                    },
+                let stateid = stateid4 {
+                    seqid: o.seqid,
+                    other: sid.other,
+                };
+                o.open_count = o.open_count.saturating_sub(1);
+                if o.open_count == 0 {
+                    g.opens.remove(&sid.other);
                 }
+                CloseOutcome::Ok { stateid }
             },
             None => CloseOutcome::Bad,
         }
@@ -493,6 +512,17 @@ impl NFS4State {
         // low half constant; only the boot half must change across restarts.
         v[4..8].copy_from_slice(&0xA5A5_A5A5u32.to_le_bytes());
         v
+    }
+
+    /// Returns true if `sid.other` names a live open stateid.
+    pub fn stateid_is_valid(&self, sid: &stateid4) -> bool {
+        let all_zero = sid.other == [0u8; NFS4_OTHER_SIZE];
+        let all_one = sid.other == [0xffu8; NFS4_OTHER_SIZE];
+        if all_zero || all_one {
+            return false;
+        }
+        let g = self.inner.lock().unwrap();
+        g.opens.contains_key(&sid.other)
     }
 }
 

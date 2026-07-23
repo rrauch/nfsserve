@@ -3,9 +3,9 @@
 
 use crate::nfs::{nfs_fh, nfsstring, opaque, specdata};
 use crate::xdr::*;
-use crate::{xdr_enum_serde, xdr_struct};
+use crate::{nfs3, xdr_enum_serde, xdr_struct};
 
-use crate::nfs3::{fattr3, ftype3, nfsstat3, nfstime3};
+use crate::nfs3::{fattr3, fsinfo3, ftype3, nfsstat3, nfstime3};
 
 use byteorder::{ReadBytesExt, WriteBytesExt};
 use num_derive::{FromPrimitive, ToPrimitive};
@@ -22,6 +22,9 @@ pub const NFS4_VERIFIER_SIZE: usize = 8;
 pub const NFS4_OTHER_SIZE: usize = 12;
 pub const NFS4_SESSIONID_SIZE: usize = 16;
 pub const NFS4_LEASE_TIME: u32 = 90;
+
+pub const MAX_REQUEST_SIZE: u32 = 1 << 20;
+pub const MAX_RESPONSE_SIZE: u32 = 1 << 20;
 
 // ---- Basic type aliases ----
 pub type filename4 = nfsstring;
@@ -52,7 +55,7 @@ pub type secret4 = Vec<u8>;
 pub type nfs_cookie4 = u64;
 
 /// nfsstat4 as defined in RFC 8881 §13.1.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum nfsstat4 {
     NFS4_OK = 0,
@@ -161,13 +164,50 @@ pub enum nfsstat4 {
     NFS4ERR_RETURNCONFLICT = 10086,
     NFS4ERR_DELEG_REVOKED = 10087,
     // -- not part of RFC --
+    #[default]
     ILLEGAL = u32::MAX,
 }
 xdr_enum_serde!(nfsstat4);
 
-impl Default for nfsstat4 {
-    fn default() -> Self {
-        Self::ILLEGAL
+impl XDR for Vec<stateid4> {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        (self.len() as u32).serialize(dest)?;
+        for e in self {
+            e.serialize(dest)?;
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        let mut n = 0u32;
+        n.deserialize(src)?;
+        self.clear();
+        for _ in 0..n {
+            let mut e = stateid4::default();
+            e.deserialize(src)?;
+            self.push(e);
+        }
+        Ok(())
+    }
+}
+
+impl XDR for Vec<nfsstat4> {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        (self.len() as u32).serialize(dest)?;
+        for e in self {
+            e.serialize(dest)?;
+        }
+        Ok(())
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        let mut n = 0u32;
+        n.deserialize(src)?;
+        self.clear();
+        for _ in 0..n {
+            let mut e = nfsstat4::default();
+            e.deserialize(src)?;
+            self.push(e);
+        }
+        Ok(())
     }
 }
 
@@ -363,94 +403,164 @@ xdr_enum_serde!(nfs_opnum4);
 #[allow(non_camel_case_types)]
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct fattr4 {
-    pub supported_attrs: Option<bitmap4>, // bit 0
-    pub ftype: Option<ftype4>,            // bit 1
-    pub fh_expire_type: Option<u32>,      // bit 2
-    pub change: Option<changeid4>,        // bit 3
-    pub size: Option<u64>,                // bit 4
-    pub link_support: Option<bool>,       // bit 5
-    pub symlink_support: Option<bool>,    // bit 6
-    pub named_attr: Option<bool>,         // bit 7
-    pub fsid: Option<fsid4>,              // bit 8
-    pub unique_handles: Option<bool>,     // bit 9
-    pub lease_time: Option<u32>,          // bit 10
-    pub rdattr_error: Option<nfsstat4>,   // bit 11
-    pub filehandle: Option<nfs_fh4>,      // bit 19
+    /// Bitmap of attributes supported for this object. (bit 0)
+    pub supported_attrs: Option<bitmap4>,
+    /// Type of the object (regular file, directory, symlink, etc.). (bit 1)
+    pub ftype: Option<ftype4>,
+    /// Server's filehandle expiration policy for this object. (bit 2)
+    pub fh_expire_type: Option<u32>,
+    /// Change counter, incremented whenever the object's data or metadata changes. (bit 3)
+    pub change: Option<changeid4>,
+    /// Size of the object in bytes. (bit 4)
+    pub size: Option<u64>,
+    /// True if the filesystem supports hard links. (bit 5)
+    pub link_support: Option<bool>,
+    /// True if the filesystem supports symbolic links. (bit 6)
+    pub symlink_support: Option<bool>,
+    /// True if this object has a named attribute directory. (bit 7)
+    pub named_attr: Option<bool>,
+    /// Unique filesystem identifier for the object. (bit 8)
+    pub fsid: Option<fsid4>,
+    /// True if two distinct filehandles are guaranteed to refer to different objects. (bit 9)
+    pub unique_handles: Option<bool>,
+    /// Duration of the server's lease in seconds. (bit 10)
+    pub lease_time: Option<u32>,
+    /// Error returned when reading this attribute as part of a directory read. (bit 11)
+    pub rdattr_error: Option<nfsstat4>,
+    /// The object's filehandle. (bit 19)
+    pub filehandle: Option<nfs_fh4>,
 
-    pub acl: Option<Vec<nfsace4>>,       // bit 12
-    pub aclsupport: Option<u32>,         // bit 13
-    pub archive: Option<bool>,           // bit 14
-    pub cansettime: Option<bool>,        // bit 15
-    pub case_insensitive: Option<bool>,  // bit 16
-    pub case_preserving: Option<bool>,   // bit 17
-    pub fileid: Option<u64>,             // bit 20
-    pub files_avail: Option<u64>,        // bit 21
-    pub files_free: Option<u64>,         // bit 22
-    pub files_total: Option<u64>,        // bit 23
-    pub hidden: Option<bool>,            // bit 25
-    pub homogeneous: Option<bool>,       // bit 26
-    pub maxfilesize: Option<u64>,        // bit 27
-    pub maxlink: Option<u32>,            // bit 28
-    pub maxname: Option<u32>,            // bit 29
-    pub maxread: Option<u64>,            // bit 30
-    pub maxwrite: Option<u64>,           // bit 31
-    pub mode: Option<mode4>,             // bit 33
-    pub no_trunc: Option<bool>,          // bit 34
-    pub numlinks: Option<u32>,           // bit 35
-    pub owner: Option<nfsstring>,        // bit 36
-    pub owner_group: Option<nfsstring>,  // bit 37
-    pub rawdev: Option<specdata4>,       // bit 41
-    pub space_avail: Option<u64>,        // bit 42
-    pub space_free: Option<u64>,         // bit 43
-    pub space_total: Option<u64>,        // bit 44
-    pub space_used: Option<u64>,         // bit 45
-    pub time_access: Option<nfstime4>,   // bit 47
-    pub time_backup: Option<nfstime4>,   // bit 49
-    pub time_create: Option<nfstime4>,   // bit 50
-    pub time_delta: Option<nfstime4>,    // bit 51
-    pub time_metadata: Option<nfstime4>, // bit 52
-    pub time_modify: Option<nfstime4>,   // bit 53
-    pub mounted_on_fileid: Option<u64>,  // bit 55
+    /// Access Control List for the object. (bit 12)
+    pub acl: Option<Vec<nfsace4>>,
+    /// Bitmask of ACL features supported by the server. (bit 13)
+    pub aclsupport: Option<u32>,
+    /// True if the object has been archived since last modification. (bit 14)
+    pub archive: Option<bool>,
+    /// True if the server can set time attributes on this object. (bit 15)
+    pub cansettime: Option<bool>,
+    /// True if filename comparisons are case-insensitive. (bit 16)
+    pub case_insensitive: Option<bool>,
+    /// True if the filesystem preserves the case of filenames. (bit 17)
+    pub case_preserving: Option<bool>,
+    /// Unique number identifying the object within its filesystem. (bit 20)
+    pub fileid: Option<u64>,
+    /// Number of file slots available to this user on the filesystem. (bit 21)
+    pub files_avail: Option<u64>,
+    /// Total number of free file slots on the filesystem. (bit 22)
+    pub files_free: Option<u64>,
+    /// Total number of file slots on the filesystem. (bit 23)
+    pub files_total: Option<u64>,
+    /// True if the object is considered hidden. (bit 25)
+    pub hidden: Option<bool>,
+    /// True if the filesystem's path characteristics are the same for all subdirectories. (bit 26)
+    pub homogeneous: Option<bool>,
+    /// Maximum file size supported by the filesystem in bytes. (bit 27)
+    pub maxfilesize: Option<u64>,
+    /// Maximum number of hard links to an object. (bit 28)
+    pub maxlink: Option<u32>,
+    /// Maximum filename length supported by the filesystem. (bit 29)
+    pub maxname: Option<u32>,
+    /// Maximum read request size supported by the server in bytes. (bit 30)
+    pub maxread: Option<u64>,
+    /// Maximum write request size supported by the server in bytes. (bit 31)
+    pub maxwrite: Option<u64>,
+    /// UNIX-style mode and permission bits. (bit 33)
+    pub mode: Option<mode4>,
+    /// True if the server rejects names longer than maxname instead of truncating. (bit 34)
+    pub no_trunc: Option<bool>,
+    /// Number of hard links to the object. (bit 35)
+    pub numlinks: Option<u32>,
+    /// String identifying the owner of the object. (bit 36)
+    pub owner: Option<nfsstring>,
+    /// String identifying the group owner of the object. (bit 37)
+    pub owner_group: Option<nfsstring>,
+    /// Device data for block/character special files. (bit 41)
+    pub rawdev: Option<specdata4>,
+    /// Disk space in bytes available to this user on the filesystem. (bit 42)
+    pub space_avail: Option<u64>,
+    /// Total free disk space in bytes on the filesystem. (bit 43)
+    pub space_free: Option<u64>,
+    /// Total disk space in bytes on the filesystem. (bit 44)
+    pub space_total: Option<u64>,
+    /// Disk space in bytes actually used by the object. (bit 45)
+    pub space_used: Option<u64>,
+    /// Time of last access to the object's data. (bit 47)
+    pub time_access: Option<nfstime4>,
+    /// Time of the last backup of the object. (bit 49)
+    pub time_backup: Option<nfstime4>,
+    /// Time the object was created. (bit 50)
+    pub time_create: Option<nfstime4>,
+    /// Smallest useful granularity of server time values. (bit 51)
+    pub time_delta: Option<nfstime4>,
+    /// Time of last metadata modification of the object. (bit 52)
+    pub time_metadata: Option<nfstime4>,
+    /// Time of last modification to the object's data. (bit 53)
+    pub time_modify: Option<nfstime4>,
+    /// File ID of the object it is mounted on (differs from fileid at mount points). (bit 55)
+    pub mounted_on_fileid: Option<u64>,
 }
 
 impl fattr4 {
-    pub fn from_fattr3(src: &fattr3) -> fattr4 {
+    pub fn from_v3(fattr: &fattr3, fsinfo: &fsinfo3) -> fattr4 {
         Self {
             supported_attrs: Some(Vec::from(SUPPORTED_ATTRS)),
-            ftype: Some(ftype4::from(src.ftype)),
-            change: Some(src.ctime.seconds as changeid4),
-            size: Some(src.size),
+            ftype: Some(ftype4::from(fattr.ftype)),
+            // full ctime resolution so changeid updates on any change
+            change: Some(((fattr.ctime.seconds as u64) << 32) | (fattr.ctime.nseconds as u64)),
+            size: Some(fattr.size),
             fsid: Some(fsid4 {
-                major: src.fsid,
+                major: fattr.fsid,
                 minor: 0,
             }),
 
-            fileid: Some(src.fileid),
-            mode: Some(src.mode),
-            numlinks: Some(src.nlink),
-            rawdev: Some(src.rdev),
-            space_used: Some(src.used),
+            fileid: Some(fattr.fileid),
+            mode: Some(fattr.mode),
+            numlinks: Some(fattr.nlink),
+            rawdev: Some(fattr.rdev),
+            space_used: Some(fattr.used),
             time_access: Some(nfstime4 {
-                seconds: src.atime.seconds as i64,
-                nseconds: src.atime.nseconds,
+                seconds: fattr.atime.seconds as i64,
+                nseconds: fattr.atime.nseconds,
             }),
             time_metadata: Some(nfstime4 {
-                seconds: src.ctime.seconds as i64,
-                nseconds: src.ctime.nseconds,
+                seconds: fattr.ctime.seconds as i64,
+                nseconds: fattr.ctime.nseconds,
             }),
             time_modify: Some(nfstime4 {
-                seconds: src.mtime.seconds as i64,
-                nseconds: src.mtime.nseconds,
+                seconds: fattr.mtime.seconds as i64,
+                nseconds: fattr.mtime.nseconds,
             }),
 
             // synthetic
             fh_expire_type: Some(0), // FH4_PERSISTENT
-            link_support: Some(false),
-            symlink_support: Some(true),
             named_attr: Some(false),
             unique_handles: Some(true),
             lease_time: Some(NFS4_LEASE_TIME),
             rdattr_error: Some(nfsstat4::NFS4_OK),
+
+            // from fsinfo3
+            link_support: Some(fsinfo.properties & nfs3::FSF_LINK != 0),
+            symlink_support: Some(fsinfo.properties & nfs3::FSF_SYMLINK != 0),
+            homogeneous: Some(fsinfo.properties & nfs3::FSF_HOMOGENEOUS != 0),
+            cansettime: Some(fsinfo.properties & nfs3::FSF_CANSETTIME != 0),
+            maxfilesize: Some(fsinfo.maxfilesize),
+
+            // clamp fs-reported limits to our session channel limits
+            maxread: Some((fsinfo.rtmax as u64).min(MAX_RESPONSE_SIZE as u64)),
+            maxwrite: Some((fsinfo.wtmax as u64).min(MAX_REQUEST_SIZE as u64)),
+
+            time_delta: Some(nfstime4 {
+                seconds: fsinfo.time_delta.seconds as i64,
+                nseconds: fsinfo.time_delta.nseconds,
+            }),
+
+            // mirror the hardcoded v3 FSSTAT values
+            space_total: Some(1024 * 1024 * 1024 * 1024),
+            space_free: Some(1024 * 1024 * 1024 * 1024),
+            space_avail: Some(1024 * 1024 * 1024 * 1024),
+            files_total: Some(1024 * 1024 * 1024),
+            files_free: Some(1024 * 1024 * 1024),
+            files_avail: Some(1024 * 1024 * 1024),
 
             ..Default::default()
         }
@@ -575,23 +685,35 @@ const SUPPORTED_ATTRS: [u32; 2] = [
         | (1 << 2)   // fh_expire_type    (mandatory, synthesized)
         | (1 << 3)   // change            (mandatory, from fattr3.ctime)
         | (1 << 4)   // size              (mandatory, from fattr3.size)
-        | (1 << 5)   // link_support      (mandatory, synthesized)
-        | (1 << 6)   // symlink_support   (mandatory, synthesized)
+        | (1 << 5)   // link_support      (mandatory, from fsinfo)
+        | (1 << 6)   // symlink_support   (mandatory, from fsinfo)
         | (1 << 7)   // named_attr        (mandatory, synthesized)
         | (1 << 8)   // fsid              (mandatory, from fattr3.fsid)
         | (1 << 9)   // unique_handles    (mandatory, synthesized)
         | (1 << 10)  // lease_time        (mandatory, synthesized)
         | (1 << 11)  // rdattr_error      (mandatory, synthesized)
-        | (1 << 19)  // filehandle        (mandatory, synthesized)
-        | (1 << 20), // fileid            (recommended, from fattr3.fileid)
+        | (1 << 15)  // cansettime        (from fsinfo)
+        | (1 << 19)  // filehandle        (populated manually by caller)
+        | (1 << 20)  // fileid            (from fattr3.fileid)
+        | (1 << 21)  // files_avail
+        | (1 << 22)  // files_free
+        | (1 << 23)  // files_total
+        | (1 << 26)  // homogeneous       (from fsinfo)
+        | (1 << 27)  // maxfilesize       (from fsinfo)
+        | (1 << 30)  // maxread           (from fsinfo, clamped)
+        | (1 << 31), // maxwrite          (from fsinfo, clamped)
     // Word 1: bits 32..63
     (1 << (33 - 32))  // mode          (from fattr3.mode)
         | (1 << (35 - 32))  // numlinks      (from fattr3.nlink)
-        | (1 << (36 - 32))  // owner         (from fattr3.uid via idmap)
-        | (1 << (37 - 32))  // owner_group   (from fattr3.gid via idmap)
+        | (1 << (36 - 32))  // owner         (populated by idmapper)
+        | (1 << (37 - 32))  // owner_group   (populated by idmapper)
         | (1 << (41 - 32))  // rawdev        (from fattr3.rdev)
+        | (1 << (42 - 32))  // space_avail
+        | (1 << (43 - 32))  // space_free
+        | (1 << (44 - 32))  // space_total
         | (1 << (45 - 32))  // space_used    (from fattr3.used)
         | (1 << (47 - 32))  // time_access   (from fattr3.atime)
+        | (1 << (51 - 32))  // time_delta    (from fsinfo)
         | (1 << (52 - 32))  // time_metadata (from fattr3.ctime)
         | (1 << (53 - 32)), // time_modify   (from fattr3.mtime)
 ];
@@ -693,6 +815,20 @@ impl XDR for fattr4 {
             w.deserialize(src)?;
         }
 
+        // 1a. Reject any attribute bit we cannot decode. Decoding an unknown
+        //     bit would leave its bytes unconsumed and desync the stream for
+        //     all following attributes. The operation layer should translate
+        //     this into NFS4ERR_ATTRNOTSUPP.
+        for (w, &word) in mask.iter().enumerate() {
+            let known = SUPPORTED_ATTRS.get(w).copied().unwrap_or(0);
+            if word & !known != 0 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "fattr4 contains unsupported attribute bits",
+                ));
+            }
+        }
+
         // 2. Read attr_vals opaque: length + bytes (+ padding), decode from it.
         let mut vlen = 0u32;
         vlen.deserialize(src)?;
@@ -775,6 +911,12 @@ impl XDR for fattr4 {
         get!(52, self.time_metadata);
         get!(53, self.time_modify);
         get!(55, self.mounted_on_fileid);
+
+        // 4. Ensure all attr_vals bytes were consumed. Trailing bytes indicate
+        //    a malformed encoding or a decode/encode mismatch.
+        if cur.position() as usize != vlen {
+            return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "fattr4 attr_vals length mismatch"));
+        }
 
         Ok(())
     }
@@ -1792,3 +1934,16 @@ pub struct COMMIT4resok {
     pub writeverf: verifier4,
 }
 xdr_struct!(COMMIT4resok, writeverf);
+
+// ---- TEST_STATEID (RFC 8881 §18.48) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TEST_STATEID4args {
+    pub ts_stateids: Vec<stateid4>,
+}
+xdr_struct!(TEST_STATEID4args, ts_stateids);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TEST_STATEID4resok {
+    pub tsr_status_codes: Vec<nfsstat4>,
+}
+xdr_struct!(TEST_STATEID4resok, tsr_status_codes);

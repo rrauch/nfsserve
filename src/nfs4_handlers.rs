@@ -12,6 +12,8 @@ use crate::nfs4::*;
 use crate::rpc::*;
 use crate::xdr::*;
 
+const MAX_COMPOUND_OPS: u32 = 16;
+
 /// Per-COMPOUND execution state.
 struct CompoundState {
     current_fh: Option<nfs_fh4>,
@@ -108,7 +110,8 @@ fn fh_to_id(context: &RPCContext, fh: &nfs_fh4) -> Result<fileid4, OpError> {
 
 async fn getattr4(context: &RPCContext, id: fileid4) -> Result<fattr4, OpError> {
     let a = context.vfs.getattr(id).await?;
-    Ok(fattr4::from_fattr3(&a))
+    let fsinfo = context.vfs.fsinfo(a.fileid).await?;
+    Ok(fattr4::from_v3(&a, &fsinfo))
 }
 
 /// getattr + assert directory; returns the fattr4 (for change-id extraction).
@@ -254,6 +257,12 @@ async fn nfsproc4_compound(
         return Ok(());
     }
 
+    if num_ops > MAX_COMPOUND_OPS {
+        make_success_reply(xid).serialize(output)?;
+        nfsstat4::NFS4ERR_TOO_MANY_OPS.serialize(output)?;
+        return Ok(());
+    }
+
     let mut state = CompoundState::new();
     let mut result_buf: Vec<u8> = Vec::new();
     let mut rescount: u32 = 0;
@@ -380,6 +389,7 @@ async fn dispatch_op(
         OP_SETATTR => op_setattr(input, op_out, state, context).await.map(DispatchResult::Status)?,
         OP_READLINK => run!(op_readlink(op_out, state, context)),
         OP_COMMIT => run!(op_commit(input, op_out, state, context)),
+        OP_TEST_STATEID => run!(op_test_stateid(input, op_out, state, context)),
         other => {
             warn!("nfs4: unimplemented op {:?}", other);
             nfsstat4::NFS4ERR_NOTSUPP.serialize(op_out)?;
@@ -453,9 +463,6 @@ async fn op_create_session(
         args.csa_cb_program,
     );
 
-    const MAX_REQUEST_SIZE: u32 = 1 << 20;
-    const MAX_RESPONSE_SIZE: u32 = 1 << 20;
-    const MAX_OPS: u32 = 8;
     const MAX_REQUESTS: u32 = 1;
 
     let fore = channel_attrs4 {
@@ -463,7 +470,7 @@ async fn op_create_session(
         ca_maxrequestsize: args.csa_fore_chan_attrs.ca_maxrequestsize.min(MAX_REQUEST_SIZE),
         ca_maxresponsesize: args.csa_fore_chan_attrs.ca_maxresponsesize.min(MAX_RESPONSE_SIZE),
         ca_maxresponsesize_cached: args.csa_fore_chan_attrs.ca_maxresponsesize_cached.min(MAX_RESPONSE_SIZE),
-        ca_maxoperations: args.csa_fore_chan_attrs.ca_maxoperations.min(MAX_OPS).max(1),
+        ca_maxoperations: args.csa_fore_chan_attrs.ca_maxoperations.min(MAX_COMPOUND_OPS).max(1),
         ca_maxrequests: args.csa_fore_chan_attrs.ca_maxrequests.min(MAX_REQUESTS).max(1),
         ca_rdma_ird: Vec::new(),
     };
@@ -872,8 +879,10 @@ async fn op_readdir(
     let mut written_any = false;
     let mut truncated = false;
 
+    let fsinfo = context.vfs.fsinfo(context.vfs.root_dir()).await?;
+
     for e in &listing.entries {
-        let mut attr = fattr4::from_fattr3(&e.attr);
+        let mut attr = fattr4::from_v3(&e.attr, &fsinfo);
         attr.filehandle = Some(context.vfs.id_to_fh(e.fileid));
         attr.retain_requested(&args.attr_request);
 
@@ -1385,6 +1394,43 @@ async fn op_commit(
         writeverf: context.nfs4_state.write_verifier(),
     };
 
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_TEST_STATEID (RFC 8881 §18.48).
+/// Reports validity of each supplied stateid.
+async fn op_test_stateid(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = TEST_STATEID4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+
+    debug!("OP_TEST_STATEID count={}", args.ts_stateids.len());
+
+    let codes: Vec<nfsstat4> = args
+        .ts_stateids
+        .iter()
+        .map(|sid| {
+            if context.nfs4_state.stateid_is_valid(sid) {
+                nfsstat4::NFS4_OK
+            } else {
+                nfsstat4::NFS4ERR_BAD_STATEID
+            }
+        })
+        .collect();
+
+    let resok = TEST_STATEID4resok {
+        tsr_status_codes: codes,
+    };
+
+    // Overall op status is NFS4_OK; per-stateid results are in the array.
     nfsstat4::NFS4_OK.serialize(op_out)?;
     resok.serialize(op_out)?;
     Ok(())
