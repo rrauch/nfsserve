@@ -36,6 +36,8 @@ struct OpenOwnerState {
     /// Last open_owner seqid seen (OPEN/CLOSE ordering, 4.0-style).
     /// In 4.1 sequencing is via SEQUENCE, but the field is still carried.
     last_seqid: u32,
+    /// NFSv4.0: set once OPEN_CONFIRM has completed for this owner.
+    confirmed: bool,
 }
 
 struct Inner {
@@ -125,6 +127,8 @@ struct ClientRecord {
     sessions: Vec<sessionid4>,
     expires: Instant,
     reclaim_complete: bool,
+    /// NFSv4.0 SETCLIENTID_CONFIRM verifier. Zero for 4.1 clients.
+    setclientid_confirm: verifier4,
 }
 
 struct SessionRecord {
@@ -237,6 +241,7 @@ impl NFS4State {
                 sessions: Vec::new(),
                 expires: Instant::now() + lease,
                 reclaim_complete: false,
+                setclientid_confirm: verifier4::default(),
             },
         );
         g.clientid_index.insert(clientid, co_ownerid.to_vec());
@@ -546,4 +551,139 @@ pub enum ResolveStateid {
 pub enum CloseOutcome {
     Ok { stateid: stateid4 },
     Bad,
+}
+
+// ---- SETCLIENTID outcomes (NFSv4.0) ----
+pub struct SetClientIdResult {
+    pub clientid: clientid4,
+    pub confirm_verifier: verifier4,
+}
+
+pub enum SetClientIdConfirmOutcome {
+    Ok,
+    StaleClientId,
+    /// clientid/verifier mismatch.
+    Mismatch,
+}
+
+pub enum RenewOutcome {
+    Ok,
+    StaleClientId,
+    Expired,
+}
+
+impl NFS4State {
+    /// SETCLIENTID (NFSv4.0). Creates an unconfirmed client record keyed by
+    /// the opaque client id, generating a fresh clientid and a confirm
+    /// verifier. A repeat with the same (id, verifier) reuses the record.
+    pub fn setclientid(&self, id: &[u8], co_verifier: &verifier4) -> SetClientIdResult {
+        let mut g = self.inner.lock().unwrap();
+
+        // If an existing record for this id has a different boot verifier,
+        // the client rebooted; drop the old state.
+        if let Some(rec) = g.clients.get(id) {
+            if &rec.co_verifier != co_verifier {
+                g.expire_client(id);
+            }
+        }
+
+        let clientid = g.fresh_clientid();
+        let lease = g.lease;
+
+        let mut confirm = verifier4::default();
+        getrandom::fill(&mut confirm).expect("OS RNG failure");
+
+        g.clients.insert(
+            id.to_vec(),
+            ClientRecord {
+                clientid,
+                co_verifier: *co_verifier,
+                seqid: 1,
+                confirmed: false,
+                sessions: Vec::new(),
+                expires: Instant::now() + lease,
+                reclaim_complete: false,
+                setclientid_confirm: confirm,
+            },
+        );
+        g.clientid_index.insert(clientid, id.to_vec());
+
+        SetClientIdResult {
+            clientid,
+            confirm_verifier: confirm,
+        }
+    }
+
+    /// SETCLIENTID_CONFIRM (NFSv4.0). Confirms the record whose clientid and
+    /// confirm verifier match.
+    pub fn setclientid_confirm(&self, clientid: clientid4, confirm: &verifier4) -> SetClientIdConfirmOutcome {
+        let mut g = self.inner.lock().unwrap();
+        let ownerid = match g.clientid_index.get(&clientid).cloned() {
+            Some(o) => o,
+            None => return SetClientIdConfirmOutcome::StaleClientId,
+        };
+        let lease = g.lease;
+        match g.clients.get_mut(&ownerid) {
+            Some(rec) => {
+                if &rec.setclientid_confirm != confirm {
+                    return SetClientIdConfirmOutcome::Mismatch;
+                }
+                rec.confirmed = true;
+                rec.expires = Instant::now() + lease;
+                SetClientIdConfirmOutcome::Ok
+            },
+            None => SetClientIdConfirmOutcome::StaleClientId,
+        }
+    }
+
+    /// RENEW (NFSv4.0). Renews the client lease.
+    pub fn renew(&self, clientid: clientid4) -> RenewOutcome {
+        let mut g = self.inner.lock().unwrap();
+        let ownerid = match g.clientid_index.get(&clientid).cloned() {
+            Some(o) => o,
+            None => return RenewOutcome::StaleClientId,
+        };
+        let lease = g.lease;
+        let now = Instant::now();
+        let expired = g.clients.get(&ownerid).map(|r| r.expires < now).unwrap_or(true);
+        if expired {
+            g.expire_client(&ownerid);
+            return RenewOutcome::Expired;
+        }
+        if let Some(rec) = g.clients.get_mut(&ownerid) {
+            rec.expires = now + lease;
+        }
+        RenewOutcome::Ok
+    }
+
+    /// OPEN_CONFIRM (NFSv4.0). Marks the open owner confirmed and bumps the
+    /// stateid seqid. Returns the confirmed stateid, or Bad on unknown stateid.
+    pub fn open_confirm(&self, sid: &stateid4) -> CloseOutcome {
+        let mut g = self.inner.lock().unwrap();
+        let (clientid, owner) = match g.opens.get(&sid.other) {
+            Some(o) => (o.clientid, o.owner.clone()),
+            None => return CloseOutcome::Bad,
+        };
+        if let Some(oo) = g.open_owners.get_mut(&(clientid, owner)) {
+            oo.confirmed = true;
+        }
+        let o = g.opens.get_mut(&sid.other).unwrap();
+        o.seqid = o.seqid.wrapping_add(1);
+        CloseOutcome::Ok {
+            stateid: stateid4 {
+                seqid: o.seqid,
+                other: sid.other,
+            },
+        }
+    }
+
+    /// Whether the open owner has been confirmed (NFSv4.0). New owners are
+    /// unconfirmed and require OPEN_CONFIRM after their first OPEN.
+    pub fn open_owner_confirmed(&self, clientid: clientid4, owner: &[u8]) -> bool {
+        let g = self.inner.lock().unwrap();
+        g.open_owners
+            .get(&(clientid, owner.to_vec()))
+            .map(|o| o.confirmed)
+            .unwrap_or(false)
+    }
 }

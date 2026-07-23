@@ -16,6 +16,7 @@ const MAX_COMPOUND_OPS: u32 = 16;
 
 /// Per-COMPOUND execution state.
 struct CompoundState {
+    minorversion: u32,
     current_fh: Option<nfs_fh4>,
     saved_fh: Option<nfs_fh4>,
     session: Option<SequenceContext>,
@@ -23,8 +24,9 @@ struct CompoundState {
 }
 
 impl CompoundState {
-    fn new() -> Self {
+    fn new(minorversion: u32) -> Self {
         Self {
+            minorversion,
             current_fh: None,
             saved_fh: None,
             session: None,
@@ -32,8 +34,12 @@ impl CompoundState {
         }
     }
 
-    /// Every non-SEQUENCE op requires a bound session.
+    /// In 4.0 there is no session, so this is a no-op. In 4.1 every op after
+    /// SEQUENCE requires a bound session.
     fn require_session(&self) -> Result<(), OpError> {
+        if self.minorversion == 0 {
+            return Ok(());
+        }
         if self.session.is_none() {
             Err(nfsstat4::NFS4ERR_OP_NOT_IN_SESSION.into())
         } else {
@@ -249,7 +255,7 @@ async fn nfsproc4_compound(
 
     debug!("nfs4 COMPOUND xid={} tag={:?} minor={} nops={}", xid, tag, minorversion, num_ops);
 
-    if minorversion != 1 {
+    if minorversion > 1 {
         make_success_reply(xid).serialize(output)?;
         nfsstat4::NFS4ERR_MINOR_VERS_MISMATCH.serialize(output)?;
         tag.serialize(output)?;
@@ -263,7 +269,7 @@ async fn nfsproc4_compound(
         return Ok(());
     }
 
-    let mut state = CompoundState::new();
+    let mut state = CompoundState::new(minorversion);
     let mut result_buf: Vec<u8> = Vec::new();
     let mut rescount: u32 = 0;
     let mut last_status = nfsstat4::NFS4_OK;
@@ -362,7 +368,28 @@ async fn dispatch_op(
         };
     }
 
+    // Cross-version rejection.
+    let v = state.minorversion;
+    let is_v41_only = matches!(
+        op,
+        OP_EXCHANGE_ID
+            | OP_CREATE_SESSION
+            | OP_DESTROY_SESSION
+            | OP_DESTROY_CLIENTID
+            | OP_SEQUENCE
+            | OP_RECLAIM_COMPLETE
+            | OP_SECINFO_NO_NAME
+    );
+    let is_v40_only =
+        matches!(op, OP_SETCLIENTID | OP_SETCLIENTID_CONFIRM | OP_RENEW | OP_OPEN_CONFIRM | OP_RELEASE_LOCKOWNER);
+    if (v != 1 && is_v41_only) || (v != 0 && is_v40_only) {
+        warn!("nfs4: op {:?} not valid in minorversion {}", op, v);
+        nfsstat4::NFS4ERR_NOTSUPP.serialize(op_out)?;
+        return Ok(DispatchResult::Status(nfsstat4::NFS4ERR_NOTSUPP));
+    }
+
     let res = match op {
+        // ---- NFSv4.1 session/clientid management ----
         OP_EXCHANGE_ID => run!(op_exchange_id(input, op_out, context)),
         OP_CREATE_SESSION => run!(op_create_session(input, op_out, context)),
         OP_DESTROY_SESSION => run!(op_destroy_session(input, op_out, state, context)),
@@ -370,6 +397,14 @@ async fn dispatch_op(
         OP_SEQUENCE => op_sequence(input, op_out, state, context).await?,
         OP_RECLAIM_COMPLETE => run!(op_reclaim_complete(input, op_out, state, context)),
         OP_SECINFO_NO_NAME => run!(op_secinfo_no_name(input, op_out, state, context)),
+
+        // ---- NFSv4.0 clientid management ----
+        OP_SETCLIENTID => run!(op_setclientid(input, op_out, context)),
+        OP_SETCLIENTID_CONFIRM => run!(op_setclientid_confirm(input, op_out, context)),
+        OP_RENEW => run!(op_renew(input, op_out, context)),
+        OP_OPEN_CONFIRM => run!(op_open_confirm(input, op_out, state, context)),
+        OP_RELEASE_LOCKOWNER => run!(op_release_lockowner(input, op_out, context)),
+
         OP_PUTROOTFH => run!(op_putrootfh(op_out, state, context)),
         OP_GETFH => run!(op_getfh(op_out, state)),
         OP_GETATTR => run!(op_getattr(input, op_out, state, context)),
@@ -1017,6 +1052,13 @@ async fn op_open(
 
     state.current_fh = Some(context.vfs.id_to_fh(fileid));
 
+    // NFSv4.0: a fresh open owner must be confirmed via OPEN_CONFIRM before
+    // its stateids are usable. 4.1 has no OPEN_CONFIRM.
+    let need_confirm =
+        state.minorversion == 0 && !context.nfs4_state.open_owner_confirmed(args.owner.clientid, &args.owner.owner);
+
+    let rflags = if need_confirm { OPEN4_RESULT_CONFIRM } else { 0 };
+
     let resok = OPEN4resok {
         stateid,
         cinfo: change_info4 {
@@ -1024,7 +1066,7 @@ async fn op_open(
             before: dir_change_before,
             after: dir_change_after,
         },
-        rflags: 0,
+        rflags,
         attrset: Vec::new(),
         delegation: open_delegation4_none,
     };
@@ -1433,5 +1475,117 @@ async fn op_test_stateid(
     // Overall op status is NFS4_OK; per-stateid results are in the array.
     nfsstat4::NFS4_OK.serialize(op_out)?;
     resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_SETCLIENTID (NFSv4.0, RFC 7530 §16.33).
+/// Establishes an unconfirmed clientid. Callback data is decoded and ignored
+/// (we grant no delegations, so we never call back).
+async fn op_setclientid(input: &mut impl Read, op_out: &mut impl Write, context: &RPCContext) -> Result<(), OpError> {
+    let mut args = SETCLIENTID4args::default();
+    args.deserialize(input)?;
+
+    debug!(
+        "OP_SETCLIENTID id={:?} cb_prog={} netid={:?} addr={:?}",
+        nfsstring::from(args.client.id.clone()),
+        args.callback.cb_program,
+        args.callback.cb_location.r_netid,
+        args.callback.cb_location.r_addr,
+    );
+
+    let res = context.nfs4_state.setclientid(&args.client.id, &args.client.verifier);
+
+    let resok = SETCLIENTID4resok {
+        clientid: res.clientid,
+        setclientid_confirm: res.confirm_verifier,
+    };
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_SETCLIENTID_CONFIRM (NFSv4.0, RFC 7530 §16.34).
+async fn op_setclientid_confirm(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = SETCLIENTID_CONFIRM4args::default();
+    args.deserialize(input)?;
+
+    debug!("OP_SETCLIENTID_CONFIRM clientid={:#x}", args.clientid);
+
+    use crate::nfs4_state::SetClientIdConfirmOutcome::*;
+    match context.nfs4_state.setclientid_confirm(args.clientid, &args.setclientid_confirm) {
+        Ok => {
+            nfsstat4::NFS4_OK.serialize(op_out)?;
+            Result::Ok(())
+        },
+        StaleClientId => Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
+        Mismatch => Err(nfsstat4::NFS4ERR_CLID_INUSE.into()),
+    }
+}
+
+/// OP_RENEW (NFSv4.0, RFC 7530 §16.30).
+async fn op_renew(input: &mut impl Read, op_out: &mut impl Write, context: &RPCContext) -> Result<(), OpError> {
+    let mut args = RENEW4args::default();
+    args.deserialize(input)?;
+
+    debug!("OP_RENEW clientid={:#x}", args.clientid);
+
+    use crate::nfs4_state::RenewOutcome::*;
+    match context.nfs4_state.renew(args.clientid) {
+        Ok => {
+            nfsstat4::NFS4_OK.serialize(op_out)?;
+            Result::Ok(())
+        },
+        StaleClientId => Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
+        Expired => Err(nfsstat4::NFS4ERR_EXPIRED.into()),
+    }
+}
+
+/// OP_OPEN_CONFIRM (NFSv4.0, RFC 7530 §16.18).
+/// Confirms the open owner established by a preceding OPEN with
+/// OPEN4_RESULT_CONFIRM set.
+async fn op_open_confirm(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = OPEN_CONFIRM4args::default();
+    args.deserialize(input)?;
+
+    state.current_fh()?; // require FH
+
+    debug!("OP_OPEN_CONFIRM seqid={} stateid.other={:x?}", args.seqid, args.open_stateid.other);
+
+    use crate::nfs4_state::CloseOutcome;
+    match context.nfs4_state.open_confirm(&args.open_stateid) {
+        CloseOutcome::Ok { stateid } => {
+            let resok = OPEN_CONFIRM4resok { open_stateid: stateid };
+            nfsstat4::NFS4_OK.serialize(op_out)?;
+            resok.serialize(op_out)?;
+            Ok(())
+        },
+        CloseOutcome::Bad => Err(nfsstat4::NFS4ERR_BAD_STATEID.into()),
+    }
+}
+
+/// OP_RELEASE_LOCKOWNER (NFSv4.0, RFC 7530 §16.37).
+/// We do not support locking, so there are never any locks held for an owner.
+/// Acknowledge unconditionally.
+async fn op_release_lockowner(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    _context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = RELEASE_LOCKOWNER4args::default();
+    args.deserialize(input)?;
+
+    debug!("OP_RELEASE_LOCKOWNER clientid={:#x}", args.lock_owner.clientid);
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
     Ok(())
 }

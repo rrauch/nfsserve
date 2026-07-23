@@ -284,11 +284,7 @@ impl From<ftype3> for ftype4 {
 }
 
 /// NFSv4.1 operation codes as defined in RFC 8881 (obsoletes RFC 5661).
-///
-/// NFSv4.0-only operations are intentionally absent: OP_OPEN_CONFIRM (20),
-/// OP_RENEW (30), OP_SETCLIENTID (35), OP_SETCLIENTID_CONFIRM (36), and
-/// OP_RELEASE_LOCKOWNER (39). Their function is subsumed by session-based
-/// operations, so `from_u32` yields `None` for those opcodes.
+/// Also contains NFSv4.0 specific opcodes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum nfs_opnum4 {
@@ -326,6 +322,8 @@ pub enum nfs_opnum4 {
     OP_OPEN = 18,
     /// Open the named-attribute directory for an object (RFC 8881 §18.17).
     OP_OPENATTR = 19,
+    /// Confirm the open owner (NFSv4.0 only) (RFC 7530 §16.18).
+    OP_OPEN_CONFIRM = 20,
     /// Reduce the access/deny modes of an open file (RFC 8881 §18.18).
     OP_OPEN_DOWNGRADE = 21,
     /// Set the current filehandle to a supplied value (RFC 8881 §18.19).
@@ -344,6 +342,8 @@ pub enum nfs_opnum4 {
     OP_REMOVE = 28,
     /// Rename a file object within/between directories (RFC 8881 §18.26).
     OP_RENAME = 29,
+    /// Renew a client lease (NFSv4.0 only) (RFC 7530 §16.30).
+    OP_RENEW = 30,
     /// Restore the saved filehandle as the current filehandle (RFC 8881 §18.27).
     OP_RESTOREFH = 31,
     /// Save the current filehandle for later restore (RFC 8881 §18.28).
@@ -352,10 +352,16 @@ pub enum nfs_opnum4 {
     OP_SECINFO = 33,
     /// Set attributes on the current filehandle (RFC 8881 §18.30).
     OP_SETATTR = 34,
+    /// Establish a clientid (NFSv4.0 only) (RFC 7530 §16.33).
+    OP_SETCLIENTID = 35,
+    /// Confirm a clientid (NFSv4.0 only) (RFC 7530 §16.34).
+    OP_SETCLIENTID_CONFIRM = 36,
     /// Verify that attributes match supplied values (RFC 8881 §18.31).
     OP_VERIFY = 37,
     /// Write data to a regular file (RFC 8881 §18.32).
     OP_WRITE = 38,
+    /// Release a lock owner (NFSv4.0 only) (RFC 7530 §16.37).
+    OP_RELEASE_LOCKOWNER = 39,
     /// Backchannel control: adjust callback channel parameters (RFC 8881 §18.33).
     OP_BACKCHANNEL_CTL = 40,
     /// Associate an additional connection with a session (RFC 8881 §18.34).
@@ -1184,6 +1190,93 @@ xdr_struct!(
     eir_server_scope,
     eir_server_impl_id
 );
+
+// ---- SETCLIENTID (NFSv4.0, RFC 7530 §16.33) ----
+
+/// clientaddr4: universal-address netid + addr (RFC 7530 §2.2.9).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct clientaddr4 {
+    pub r_netid: nfsstring,
+    pub r_addr: nfsstring,
+}
+xdr_struct!(clientaddr4, r_netid, r_addr);
+
+/// cb_client4: callback program + location. We never call back, but must
+/// decode it to stay stream-aligned.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct cb_client4 {
+    pub cb_program: u32,
+    pub cb_location: clientaddr4,
+}
+xdr_struct!(cb_client4, cb_program, cb_location);
+
+/// nfs_client_id4: verifier + opaque client id (RFC 7530 §16.33).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct nfs_client_id4 {
+    pub verifier: verifier4,
+    pub id: Vec<u8>,
+}
+xdr_struct!(nfs_client_id4, verifier, id);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SETCLIENTID4args {
+    pub client: nfs_client_id4,
+    pub callback: cb_client4,
+    pub callback_ident: u32,
+}
+xdr_struct!(SETCLIENTID4args, client, callback, callback_ident);
+
+/// SETCLIENTID4resok (the NFS4_OK arm). The NFS4ERR_CLID_INUSE arm carries a
+/// clientaddr4 instead; we never emit it in this lean impl.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SETCLIENTID4resok {
+    pub clientid: clientid4,
+    pub setclientid_confirm: verifier4,
+}
+xdr_struct!(SETCLIENTID4resok, clientid, setclientid_confirm);
+
+// ---- SETCLIENTID_CONFIRM (NFSv4.0, RFC 7530 §16.34) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SETCLIENTID_CONFIRM4args {
+    pub clientid: clientid4,
+    pub setclientid_confirm: verifier4,
+}
+xdr_struct!(SETCLIENTID_CONFIRM4args, clientid, setclientid_confirm);
+
+// ---- RENEW (NFSv4.0, RFC 7530 §16.30) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RENEW4args {
+    pub clientid: clientid4,
+}
+xdr_struct!(RENEW4args, clientid);
+
+// ---- OPEN_CONFIRM (NFSv4.0, RFC 7530 §16.18) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OPEN_CONFIRM4args {
+    pub open_stateid: stateid4,
+    pub seqid: seqid4,
+}
+xdr_struct!(OPEN_CONFIRM4args, open_stateid, seqid);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct OPEN_CONFIRM4resok {
+    pub open_stateid: stateid4,
+}
+xdr_struct!(OPEN_CONFIRM4resok, open_stateid);
+
+// ---- RELEASE_LOCKOWNER (NFSv4.0, RFC 7530 §16.37) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct lock_owner4 {
+    pub clientid: clientid4,
+    pub owner: Vec<u8>,
+}
+xdr_struct!(lock_owner4, clientid, owner);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct RELEASE_LOCKOWNER4args {
+    pub lock_owner: lock_owner4,
+}
+xdr_struct!(RELEASE_LOCKOWNER4args, lock_owner);
 
 // ---- CREATE_SESSION (RFC 8881 §18.36) ----
 
