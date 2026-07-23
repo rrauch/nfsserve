@@ -425,6 +425,7 @@ async fn dispatch_op(
         OP_READLINK => run!(op_readlink(op_out, state, context)),
         OP_COMMIT => run!(op_commit(input, op_out, state, context)),
         OP_TEST_STATEID => run!(op_test_stateid(input, op_out, state, context)),
+        OP_SECINFO => run!(op_secinfo(input, op_out, state, context)),
         other => {
             warn!("nfs4: unimplemented op {:?}", other);
             nfsstat4::NFS4ERR_NOTSUPP.serialize(op_out)?;
@@ -719,6 +720,52 @@ async fn op_secinfo_no_name(
     flavors.serialize(op_out)?;
 
     // SECINFO_NO_NAME consumes the current filehandle.
+    state.current_fh = None;
+    Ok(())
+}
+
+/// OP_SECINFO (RFC 8881 §18.29, RFC 7530 §16.31).
+/// Looks up `name` in the current directory FH and reports supported security
+/// flavors. Per spec the current filehandle is consumed on success.
+async fn op_secinfo(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = SECINFO4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    if args.name.0.is_empty() {
+        return Err(nfsstat4::NFS4ERR_INVAL.into());
+    }
+
+    let dir_fh = state.current_fh()?;
+    let dirid = fh_to_id(context, dir_fh)?;
+    require_dir(context, dirid).await?;
+
+    let name: filename4 = args.name.0.clone().into();
+    debug!("OP_SECINFO dir={} name={:?}", dirid, args.name);
+
+    // The named entry must exist.
+    context.vfs.lookup(dirid, &name).await?;
+
+    let flavors = vec![
+        secinfo4 {
+            flavor: AUTH_SYS,
+            gss_info: None,
+        },
+        secinfo4 {
+            flavor: AUTH_NONE,
+            gss_info: None,
+        },
+    ];
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    flavors.serialize(op_out)?;
+
+    // SECINFO consumes the current filehandle.
     state.current_fh = None;
     Ok(())
 }

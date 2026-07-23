@@ -45,6 +45,11 @@ impl From<Vec<u8>> for nfsstring {
         Self(value)
     }
 }
+impl From<String> for nfsstring {
+    fn from(value: String) -> Self {
+        Self(value.into_bytes())
+    }
+}
 impl From<&[u8]> for nfsstring {
     fn from(value: &[u8]) -> Self {
         Self(value.into())

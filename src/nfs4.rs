@@ -568,6 +568,9 @@ impl fattr4 {
             files_free: Some(1024 * 1024 * 1024),
             files_avail: Some(1024 * 1024 * 1024),
 
+            owner: Some(format!("{}", fattr.uid).into()),
+            owner_group: Some(format!("{}", fattr.gid).into()),
+
             ..Default::default()
         }
     }
@@ -1999,6 +2002,13 @@ pub struct SECINFO_NO_NAME4args {
     pub style: secinfo_style4,
 }
 xdr_struct!(SECINFO_NO_NAME4args, style);
+
+// ---- SECINFO (RFC 8881 §18.29 / RFC 7530 §16.31) ----
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct SECINFO4args {
+    pub name: component4,
+}
+xdr_struct!(SECINFO4args, name);
 
 /// SECINFO4resok = secinfo4<>  (shared by SECINFO and SECINFO_NO_NAME).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
