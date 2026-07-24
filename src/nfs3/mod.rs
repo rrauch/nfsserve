@@ -4,6 +4,8 @@
 #![allow(non_camel_case_types)]
 
 mod handlers;
+pub(crate) mod mount;
+pub(crate) mod portmap;
 
 pub(crate) use handlers::handle_nfs;
 
@@ -15,7 +17,6 @@ use byteorder::{ReadBytesExt, WriteBytesExt};
 use filetime;
 use num_derive::{FromPrimitive, ToPrimitive};
 use num_traits::cast::FromPrimitive;
-
 // Transcribed from RFC 1813.
 
 // Section 2.2 Constants
@@ -158,7 +159,7 @@ xdr_enum_serde!(nfsstat3);
 
 /// File Type
 #[allow(non_camel_case_types)]
-#[derive(Copy, Clone, Debug, Default, FromPrimitive, ToPrimitive)]
+#[derive(Copy, Clone, Debug, Default, PartialEq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
 pub enum ftype3 {
     /// Regular File

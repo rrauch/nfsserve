@@ -5,7 +5,7 @@ use num_traits::cast::FromPrimitive;
 use tracing::{debug, error};
 
 use crate::context::RPCContext;
-use crate::portmap;
+use crate::nfs3::portmap;
 use crate::rpc::*;
 use crate::xdr::*;
 

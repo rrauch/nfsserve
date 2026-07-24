@@ -8,7 +8,7 @@ use tracing::{debug, error, trace, warn};
 use crate::context::RPCContext;
 use crate::rpc::*;
 use crate::xdr::*;
-use crate::{mount, mount_handlers, nfs, nfs3, nfs4, portmap, portmap_handlers};
+use crate::{nfs, nfs3, nfs3::mount, nfs3::portmap, nfs4};
 
 // Information from RFC 5531
 // https://datatracker.ietf.org/doc/html/rfc5531
@@ -55,9 +55,9 @@ async fn handle_rpc(
                     return Ok(true);
                 }
             } else if call.prog == portmap::PROGRAM {
-                portmap_handlers::handle_portmap(xid, call, input, output, &context)
+                portmap::handle_portmap(xid, call, input, output, &context)
             } else if call.prog == mount::PROGRAM {
-                mount_handlers::handle_mount(xid, call, input, output, &context).await
+                mount::handle_mount(xid, call, input, output, &context).await
             } else if call.prog == NFS_ACL_PROGRAM
                 || call.prog == NFS_ID_MAP_PROGRAM
                 || call.prog == NFS_METADATA_PROGRAM

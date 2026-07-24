@@ -5,7 +5,8 @@ use num_traits::cast::{FromPrimitive, ToPrimitive};
 use tracing::debug;
 
 use crate::context::RPCContext;
-use crate::mount::*;
+use crate::nfs::id_to_fh;
+use crate::nfs3::mount::*;
 use crate::rpc::*;
 use crate::xdr::*;
 
@@ -100,7 +101,7 @@ pub async fn mountproc3_mnt(
     };
     if let Ok(fileid) = context.vfs.path_to_id(&path).await {
         let response = mountres3_ok {
-            fhandle: context.vfs.id_to_fh(fileid).data,
+            fhandle: id_to_fh(&context.nfs4_state, fileid).data,
             auth_flavors: vec![
                 auth_flavor::AUTH_NULL.to_u32().unwrap(),
                 auth_flavor::AUTH_UNIX.to_u32().unwrap(),

@@ -158,11 +158,11 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
         Ok(NFSTcpListener {
             listener,
             port,
-            arcfs,
+            arcfs: arcfs.clone(),
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
-            nfs4_state: Arc::new(NFS4State::new(Duration::from_secs((NFS4_LEASE_TIME as u64 * 2) + 1))),
+            nfs4_state: Arc::new(NFS4State::new(Duration::from_secs((NFS4_LEASE_TIME as u64 * 2) + 1), arcfs)),
         })
     }
 

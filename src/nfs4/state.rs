@@ -1,20 +1,53 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
-use crate::nfs4::{channel_attrs4, clientid4, sequenceid4, sessionid4, slotid4, stateid4, verifier4, NFS4_OTHER_SIZE};
+use crate::nfs4::{
+    channel_attrs4, clientid4, nfsstat4, sequenceid4, sessionid4, slotid4, stateid4, verifier4, NFS4_OTHER_SIZE,
+};
+use crate::vfs::{vfs_fh, NFSFileSystem, OpenMode};
 use std::collections::HashMap;
+use std::ops::Deref;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
+use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 pub struct NFS4State {
     inner: Arc<Mutex<Inner>>,
+    closer_tx: mpsc::Sender<vfs_fh>,
     _reaper: JoinHandle<()>,
+    _closer: JoinHandle<()>,
 }
 
 impl Drop for NFS4State {
     fn drop(&mut self) {
         self._reaper.abort();
+        self._closer.abort();
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ManagedFileHandle(Arc<ManagedFileHandleInner>);
+
+impl ManagedFileHandle {
+    fn new(vfs_fh: vfs_fh, tx: mpsc::Sender<vfs_fh>) -> Self {
+        Self(Arc::new(ManagedFileHandleInner(vfs_fh, tx)))
+    }
+}
+
+impl Deref for ManagedFileHandle {
+    type Target = vfs_fh;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0 .0
+    }
+}
+
+#[derive(Debug)]
+struct ManagedFileHandleInner(vfs_fh, mpsc::Sender<vfs_fh>);
+impl Drop for ManagedFileHandleInner {
+    fn drop(&mut self) {
+        let _ = self.1.try_send(self.0);
     }
 }
 
@@ -22,11 +55,11 @@ struct OpenState {
     clientid: clientid4,
     owner: Vec<u8>,
     fileid: u64,
+    fh: ManagedFileHandle,
     /// Current stateid seqid; bumped on every state-mutating op (e.g. CLOSE
     /// would consume/close it). Starts at 1.
     seqid: u32,
-    share_access: u32,
-    share_deny: u32,
+    mode: OpenMode,
     /// Number of outstanding OPENs collapsed into this state.
     open_count: u32,
 }
@@ -55,6 +88,7 @@ struct Inner {
     opens: HashMap<[u8; NFS4_OTHER_SIZE], OpenState>,
     /// (clientid, open_owner bytes) -> per-owner seqid bookkeeping.
     open_owners: HashMap<(clientid4, Vec<u8>), OpenOwnerState>,
+    vfs: Arc<dyn NFSFileSystem + Send + Sync>,
 }
 
 impl Inner {
@@ -90,6 +124,24 @@ impl Inner {
                 break other;
             }
         }
+    }
+
+    /// Resolve a clientid to its mutable client record via the reverse index.
+    fn client_mut(&mut self, clientid: clientid4) -> Option<&mut ClientRecord> {
+        let ownerid = self.clientid_index.get(&clientid)?.clone();
+        self.clients.get_mut(&ownerid)
+    }
+
+    /// Resolve a clientid to its owning record's ownerid, expiring the client
+    /// if its lease has lapsed. Returns `Some(ownerid)` only for a live client.
+    fn client_if_live(&mut self, clientid: clientid4, now: Instant) -> Option<Vec<u8>> {
+        let ownerid = self.clientid_index.get(&clientid)?.clone();
+        let expired = self.clients.get(&ownerid).map(|r| r.expires < now).unwrap_or(true);
+        if expired {
+            self.expire_client(&ownerid);
+            return None;
+        }
+        Some(ownerid)
     }
 
     /// Remove a client, its reverse index, and all its sessions and open file handles.
@@ -176,7 +228,7 @@ pub(super) enum SequenceOutcome {
 }
 
 impl NFS4State {
-    pub(crate) fn new(lease: Duration) -> Self {
+    pub(crate) fn new(lease: Duration, vfs: Arc<dyn NFSFileSystem + Send + Sync>) -> Self {
         let inner = Arc::new(Mutex::new(Inner {
             lease,
             boot_verifier: getrandom::u32().expect("OS RNG failure"),
@@ -185,7 +237,29 @@ impl NFS4State {
             sessions: HashMap::new(),
             opens: HashMap::new(),
             open_owners: HashMap::new(),
+            vfs: vfs.clone(),
         }));
+
+        let (closer_tx, mut closer_rx) = mpsc::channel(2048);
+
+        let _closer = {
+            let vfs = vfs.clone();
+            tokio::task::spawn(async move {
+                loop {
+                    if closer_rx.is_closed() {
+                        break;
+                    }
+                    match closer_rx.recv().await {
+                        Some(vfs_fh) => {
+                            let _ = vfs.close(vfs_fh).await;
+                        },
+                        None => {
+                            break;
+                        },
+                    }
+                }
+            })
+        };
 
         let _reaper = {
             let inner = inner.clone();
@@ -200,7 +274,12 @@ impl NFS4State {
             })
         };
 
-        Self { inner, _reaper }
+        Self {
+            inner,
+            closer_tx,
+            _reaper,
+            _closer,
+        }
     }
 
     /// EXCHANGE_ID: create or refresh an (unconfirmed) client record.
@@ -219,13 +298,7 @@ impl NFS4State {
                 };
             }
             // Verifier changed => client rebooted. Drop old record + sessions.
-            let old_cid = rec.clientid;
-            let old_sessions = rec.sessions.clone();
-            g.clientid_index.remove(&old_cid);
-            for sid in old_sessions {
-                g.sessions.remove(&sid);
-            }
-            g.clients.remove(co_ownerid);
+            g.expire_client(co_ownerid);
         }
 
         let clientid = g.fresh_clientid();
@@ -319,19 +392,14 @@ impl NFS4State {
             Some(s) => s.clientid,
             None => return SequenceOutcome::BadSession,
         };
-        let ownerid = match g.clientid_index.get(&clientid) {
-            Some(o) => o.clone(),
-            None => return SequenceOutcome::BadSession,
-        };
 
         // Lease check: expired => purge whole client, session is now gone.
         let lease = g.lease;
         let now = Instant::now();
-        let expired = g.clients.get(&ownerid).map(|r| r.expires < now).unwrap_or(true);
-        if expired {
-            g.expire_client(&ownerid);
-            return SequenceOutcome::BadSession;
-        }
+        let ownerid = match g.client_if_live(clientid, now) {
+            Some(o) => o,
+            None => return SequenceOutcome::BadSession,
+        };
 
         // Slot processing.
         let sess = g.sessions.get_mut(sessionid).unwrap();
@@ -380,10 +448,8 @@ impl NFS4State {
         let mut g = self.inner.lock().unwrap();
         match g.sessions.remove(sessionid) {
             Some(sess) => {
-                if let Some(owner) = g.clientid_index.get(&sess.clientid).cloned() {
-                    if let Some(rec) = g.clients.get_mut(&owner) {
-                        rec.sessions.retain(|s| s != sessionid);
-                    }
+                if let Some(rec) = g.client_mut(sess.clientid) {
+                    rec.sessions.retain(|s| s != sessionid);
                 }
                 true
             },
@@ -414,55 +480,60 @@ impl NFS4State {
             Some(s) => s.clientid,
             None => return,
         };
-        if let Some(ownerid) = g.clientid_index.get(&clientid).cloned() {
-            if let Some(rec) = g.clients.get_mut(&ownerid) {
-                rec.reclaim_complete = true;
-            }
+        if let Some(rec) = g.client_mut(clientid) {
+            rec.reclaim_complete = true;
         }
     }
 
-    pub(super) fn open(
+    pub(super) async fn open(
         &self,
         clientid: clientid4,
         owner: &[u8],
         owner_seqid: u32,
         fileid: u64,
-        share_access: u32,
-        share_deny: u32,
+        open_mode: OpenMode,
     ) -> OpenOutcome {
-        let mut g = self.inner.lock().unwrap();
-        if !g.clientid_index.contains_key(&clientid) {
-            return OpenOutcome::StaleClientId;
-        }
-        g.open_owners.entry((clientid, owner.to_vec())).or_default().last_seqid = owner_seqid;
+        let (other, vfs) =
+            {
+                let mut g = self.inner.lock().unwrap();
 
-        if let Some((other, o)) = g
-            .opens
-            .iter_mut()
-            .find(|(_, o)| o.clientid == clientid && o.owner == owner && o.fileid == fileid)
-        {
-            o.seqid = o.seqid.wrapping_add(1);
-            o.share_access |= share_access;
-            o.share_deny |= share_deny;
-            o.open_count += 1;
-            return OpenOutcome::Ok {
-                stateid: stateid4 {
-                    seqid: o.seqid,
-                    other: *other,
-                },
+                if !g.clientid_index.contains_key(&clientid) {
+                    return OpenOutcome::StaleClientId;
+                }
+                g.open_owners.entry((clientid, owner.to_vec())).or_default().last_seqid = owner_seqid;
+
+                if let Some((other, o)) = g.opens.iter_mut().find(|(_, o)| {
+                    o.clientid == clientid && o.owner == owner && o.fileid == fileid && o.mode == open_mode
+                }) {
+                    o.seqid = o.seqid.wrapping_add(1);
+                    o.open_count += 1;
+                    return OpenOutcome::Ok {
+                        stateid: stateid4 {
+                            seqid: o.seqid,
+                            other: *other,
+                        },
+                    };
+                }
+                (g.fresh_stateid_other(), g.vfs.clone())
             };
-        }
 
-        let other = g.fresh_stateid_other();
+        let fh = match vfs.open(fileid, open_mode).await {
+            Ok(vfs_fh) => ManagedFileHandle::new(vfs_fh, self.closer_tx.clone()),
+            Err(stat) => {
+                return OpenOutcome::Err(stat.into());
+            },
+        };
+
+        let mut g = self.inner.lock().unwrap();
         g.opens.insert(
             other,
             OpenState {
                 clientid,
                 owner: owner.to_vec(),
                 fileid,
+                fh,
                 seqid: 1,
-                share_access,
-                share_deny,
+                mode: open_mode,
                 open_count: 1,
             },
         );
@@ -474,10 +545,7 @@ impl NFS4State {
     /// Validate a stateid for READ/WRITE. Returns the fileid on success.
     /// Accepts special stateids (all-zero / all-one) as anonymous access.
     pub(super) fn resolve_stateid(&self, sid: &stateid4) -> ResolveStateid {
-        // Special stateids: seqid 0 or 0xffffffff with all-zero/all-one other.
-        let all_zero = sid.other == [0u8; NFS4_OTHER_SIZE];
-        let all_one = sid.other == [0xffu8; NFS4_OTHER_SIZE];
-        if all_zero || all_one {
+        if is_special(&sid.other) {
             return ResolveStateid::Special;
         }
 
@@ -485,7 +553,8 @@ impl NFS4State {
         match g.opens.get(&sid.other) {
             Some(o) => ResolveStateid::Open {
                 fileid: o.fileid,
-                share_access: o.share_access,
+                fh: o.fh.clone(),
+                mode: o.mode,
             },
             None => ResolveStateid::Bad,
         }
@@ -516,24 +585,28 @@ impl NFS4State {
 
     /// Stable per-boot write verifier (8 bytes). Derived from boot_verifier.
     pub fn write_verifier(&self) -> [u8; 8] {
-        let g = self.inner.lock().unwrap();
-        let mut v = [0u8; 8];
-        v[0..4].copy_from_slice(&g.boot_verifier.to_le_bytes());
+        let boot = self.inner.lock().unwrap().boot_verifier.to_le_bytes();
         // low half constant; only the boot half must change across restarts.
-        v[4..8].copy_from_slice(&0xA5A5_A5A5u32.to_le_bytes());
-        v
+        [boot[0], boot[1], boot[2], boot[3], 0xA5, 0xA5, 0xA5, 0xA5]
+    }
+
+    pub fn boot_verifier(&self) -> u32 {
+        self.inner.lock().unwrap().boot_verifier
     }
 
     /// Returns true if `sid.other` names a live open stateid.
     pub(super) fn stateid_is_valid(&self, sid: &stateid4) -> bool {
-        let all_zero = sid.other == [0u8; NFS4_OTHER_SIZE];
-        let all_one = sid.other == [0xffu8; NFS4_OTHER_SIZE];
-        if all_zero || all_one {
+        if is_special(&sid.other) {
             return false;
         }
         let g = self.inner.lock().unwrap();
         g.opens.contains_key(&sid.other)
     }
+}
+
+/// Whether a stateid's `other` is a special (all-zero / all-one) stateid.
+fn is_special(other: &[u8; NFS4_OTHER_SIZE]) -> bool {
+    *other == [0u8; NFS4_OTHER_SIZE] || *other == [0xffu8; NFS4_OTHER_SIZE]
 }
 
 pub(super) enum DestroyClientIdOutcome {
@@ -545,10 +618,15 @@ pub(super) enum DestroyClientIdOutcome {
 pub(super) enum OpenOutcome {
     Ok { stateid: stateid4 },
     StaleClientId,
+    Err(nfsstat4),
 }
 
 pub(super) enum ResolveStateid {
-    Open { fileid: u64, share_access: u32 },
+    Open {
+        fileid: u64,
+        fh: ManagedFileHandle,
+        mode: OpenMode,
+    },
     Special,
     Bad,
 }
@@ -623,12 +701,8 @@ impl NFS4State {
     /// confirm verifier match.
     pub(super) fn setclientid_confirm(&self, clientid: clientid4, confirm: &verifier4) -> SetClientIdConfirmOutcome {
         let mut g = self.inner.lock().unwrap();
-        let ownerid = match g.clientid_index.get(&clientid).cloned() {
-            Some(o) => o,
-            None => return SetClientIdConfirmOutcome::StaleClientId,
-        };
         let lease = g.lease;
-        match g.clients.get_mut(&ownerid) {
+        match g.client_mut(clientid) {
             Some(rec) => {
                 if &rec.setclientid_confirm != confirm {
                     return SetClientIdConfirmOutcome::Mismatch;
@@ -644,21 +718,20 @@ impl NFS4State {
     /// RENEW (NFSv4.0). Renews the client lease.
     pub(super) fn renew(&self, clientid: clientid4) -> RenewOutcome {
         let mut g = self.inner.lock().unwrap();
-        let ownerid = match g.clientid_index.get(&clientid).cloned() {
-            Some(o) => o,
-            None => return RenewOutcome::StaleClientId,
-        };
+        if !g.clientid_index.contains_key(&clientid) {
+            return RenewOutcome::StaleClientId;
+        }
         let lease = g.lease;
         let now = Instant::now();
-        let expired = g.clients.get(&ownerid).map(|r| r.expires < now).unwrap_or(true);
-        if expired {
-            g.expire_client(&ownerid);
-            return RenewOutcome::Expired;
+        match g.client_if_live(clientid, now) {
+            Some(ownerid) => {
+                if let Some(rec) = g.clients.get_mut(&ownerid) {
+                    rec.expires = now + lease;
+                }
+                RenewOutcome::Ok
+            },
+            None => RenewOutcome::Expired,
         }
-        if let Some(rec) = g.clients.get_mut(&ownerid) {
-            rec.expires = now + lease;
-        }
-        RenewOutcome::Ok
     }
 
     /// OPEN_CONFIRM (NFSv4.0). Marks the open owner confirmed and bumps the

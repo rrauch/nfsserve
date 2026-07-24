@@ -1,7 +1,3 @@
-use std::cmp::Ordering;
-use std::sync::Once;
-use std::time::SystemTime;
-
 use async_trait::async_trait;
 
 use crate::nfs3;
@@ -46,23 +42,23 @@ impl ReadDirSimpleResult {
     }
 }
 
-static mut GENERATION_NUMBER: u64 = 0;
-static GENERATION_NUMBER_INIT: Once = Once::new();
-
-fn get_generation_number() -> u64 {
-    unsafe {
-        GENERATION_NUMBER_INIT.call_once(|| {
-            GENERATION_NUMBER = SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis() as u64;
-        });
-        GENERATION_NUMBER
-    }
-}
-
 /// What capabilities are supported
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum VFSCapabilities {
     ReadOnly,
     ReadWrite,
 }
+
+/// The mode in which a file is opened
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+pub enum OpenMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[allow(non_camel_case_types)]
+/// Represents a reference to an open file handle
+pub type vfs_fh = u32;
 
 /// The basic API to implement to provide an NFS file system
 ///
@@ -114,18 +110,40 @@ pub trait NFSFileSystem: Sync {
     /// this should return Err(nfsstat3::NFS3ERR_ROFS) if readonly
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3>;
 
+    /// Opens a file for reading or writing, returning a file handle.
+    /// Returns Err(nfsstat3::NFS3ERR_ISDIR) if the id refers to a directory.
+    /// If opened for writing on a readonly file system
+    /// this should return Err(nfsstat3::NFS3ERR_ROFS). Optional.
+    async fn open(&self, id: fileid3, mode: OpenMode) -> Result<vfs_fh, nfsstat3> {
+        let attr = self.getattr(id).await?;
+        if attr.ftype == ftype3::NF3DIR {
+            return Err(nfsstat3::NFS3ERR_ISDIR);
+        }
+        if mode == OpenMode::ReadWrite && (self.capabilities() == VFSCapabilities::ReadOnly) {
+            return Err(nfsstat3::NFS3ERR_ROFS);
+        }
+        // generate a random fh
+        Ok(getrandom::u32().expect("OS RNG failure"))
+    }
+
+    /// Closes a previously opened file handle.
+    #[allow(unused)]
+    async fn close(&self, fh: vfs_fh) -> Result<(), nfsstat3> {
+        Ok(())
+    }
+
     /// Reads the contents of a file returning (bytes, EOF)
     /// Note that offset/count may go past the end of the file and that
     /// in that case, all bytes till the end of file are returned.
     /// EOF must be flagged if the end of the file is reached by the read.
-    async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3>;
+    async fn read(&self, fh: vfs_fh, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3>;
 
     /// Writes the contents of a file returning (bytes, EOF)
     /// Note that offset/count may go past the end of the file and that
     /// in that case, the file is extended.
     /// If not supported due to readonly file system
     /// this should return Err(nfsstat3::NFS3ERR_ROFS)
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3>;
+    async fn write(&self, fh: vfs_fh, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3>;
 
     /// Creates a file with the following attributes.
     /// If not supported due to readonly file system
@@ -218,28 +236,6 @@ pub trait NFSFileSystem: Sync {
         Ok(res)
     }
 
-    /// Converts the fileid to an opaque NFS file handle. Optional.
-    fn id_to_fh(&self, id: fileid3) -> nfs_fh3 {
-        let gennum = get_generation_number();
-        let mut ret: Vec<u8> = Vec::new();
-        ret.extend_from_slice(&gennum.to_le_bytes());
-        ret.extend_from_slice(&id.to_le_bytes());
-        nfs_fh3 { data: ret }
-    }
-    /// Converts an opaque NFS file handle to a fileid.  Optional.
-    fn fh_to_id(&self, id: &nfs_fh3) -> Result<fileid3, nfsstat3> {
-        if id.data.len() != 16 {
-            return Err(nfsstat3::NFS3ERR_BADHANDLE);
-        }
-        let gen = u64::from_le_bytes(id.data[0..8].try_into().unwrap());
-        let id = u64::from_le_bytes(id.data[8..16].try_into().unwrap());
-        let gennum = get_generation_number();
-        match gen.cmp(&gennum) {
-            Ordering::Less => Err(nfsstat3::NFS3ERR_STALE),
-            Ordering::Greater => Err(nfsstat3::NFS3ERR_BADHANDLE),
-            Ordering::Equal => Ok(id),
-        }
-    }
     /// Converts a complete path to a fileid.  Optional.
     /// The default implementation walks the directory structure with lookup()
     async fn path_to_id(&self, path: &[u8]) -> Result<fileid3, nfsstat3> {
@@ -252,10 +248,5 @@ pub trait NFSFileSystem: Sync {
             fid = self.lookup(fid, &component.into()).await?;
         }
         Ok(fid)
-    }
-
-    fn serverid(&self) -> cookieverf3 {
-        let gennum = get_generation_number();
-        gennum.to_le_bytes()
     }
 }

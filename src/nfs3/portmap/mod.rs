@@ -3,6 +3,10 @@
 // And its nice to keep the original RFC names and case
 #![allow(non_camel_case_types)]
 
+mod handlers;
+
+pub(crate) use handlers::handle_portmap;
+
 use std::io::{Read, Write};
 
 use crate::xdr::*;

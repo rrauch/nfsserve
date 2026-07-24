@@ -1,15 +1,17 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
-use std::io::{Cursor, Read, Write};
-
 use num_traits::cast::FromPrimitive;
+use std::io::{Cursor, Read, Write};
 use tracing::{debug, warn};
 
 use crate::context::RPCContext;
-use crate::nfs::nfsstring;
+use crate::nfs;
+use crate::nfs::{id_to_fh, nfsstring};
+use crate::nfs4::state::ManagedFileHandle;
 use crate::nfs4::*;
 use crate::rpc::*;
+use crate::vfs::OpenMode;
 use crate::xdr::*;
 
 const MAX_COMPOUND_OPS: u32 = 16;
@@ -111,7 +113,7 @@ macro_rules! ensure_ftype {
 // ---------------------------------------------------------------------------
 
 fn fh_to_id(context: &RPCContext, fh: &nfs_fh4) -> Result<fileid4, OpError> {
-    Ok(context.vfs.fh_to_id(fh)?)
+    Ok(nfs::fh_to_id(&context.nfs4_state, fh)?)
 }
 
 async fn getattr4(context: &RPCContext, id: fileid4) -> Result<fattr4, OpError> {
@@ -177,25 +179,29 @@ enum Need {
 
 /// Validate a stateid against the current file: special stateids are always
 /// allowed; open stateids must match the file and carry the needed access.
-fn check_stateid(context: &RPCContext, stateid: &stateid4, fileid: fileid4, need: Need) -> Result<(), OpError> {
+fn check_stateid(
+    context: &RPCContext,
+    stateid: &stateid4,
+    fileid: fileid4,
+    need: Need,
+) -> Result<Option<ManagedFileHandle>, OpError> {
     use super::state::ResolveStateid;
     match context.nfs4_state.resolve_stateid(stateid) {
-        ResolveStateid::Special => Ok(()),
+        ResolveStateid::Special => Ok(None),
         ResolveStateid::Open {
             fileid: sid_fileid,
-            share_access,
+            fh: vfs_fh,
+            mode,
         } => {
             if sid_fileid != fileid {
                 return Err(nfsstat4::NFS4ERR_BAD_STATEID.into());
             }
-            let bit = match need {
-                Need::Read => OPEN4_SHARE_ACCESS_READ,
-                Need::Write => OPEN4_SHARE_ACCESS_WRITE,
-            };
-            if share_access & bit == 0 {
-                return Err(nfsstat4::NFS4ERR_OPENMODE.into());
+            match (need, mode) {
+                (Need::Read, OpenMode::ReadOnly) => {},
+                (Need::Write, OpenMode::ReadWrite) => {},
+                _ => return Err(nfsstat4::NFS4ERR_OPENMODE.into()),
             }
-            Ok(())
+            Ok(Some(vfs_fh))
         },
         ResolveStateid::Bad => Err(nfsstat4::NFS4ERR_BAD_STATEID.into()),
     }
@@ -776,7 +782,7 @@ async fn op_putrootfh(op_out: &mut impl Write, state: &mut CompoundState, contex
     state.require_session()?;
 
     let root = context.vfs.root_dir();
-    let fh = context.vfs.id_to_fh(root);
+    let fh = id_to_fh(&context.nfs4_state, root);
 
     debug!("OP_PUTROOTFH root_id={} fh={:x?}", root, fh.data);
 
@@ -912,7 +918,7 @@ async fn op_lookup(
     debug!("OP_LOOKUP dir={} name={:?}", dirid, args.objname);
 
     let objid = context.vfs.lookup(dirid, &name).await?;
-    state.current_fh = Some(context.vfs.id_to_fh(objid));
+    state.current_fh = Some(id_to_fh(&context.nfs4_state, objid));
 
     nfsstat4::NFS4_OK.serialize(op_out)?;
     Ok(())
@@ -965,7 +971,7 @@ async fn op_readdir(
 
     for e in &listing.entries {
         let mut attr = fattr4::from_v3(&e.attr, &fsinfo);
-        attr.filehandle = Some(context.vfs.id_to_fh(e.fileid));
+        attr.filehandle = Some(id_to_fh(&context.nfs4_state, e.fileid));
         attr.retain_requested(&args.attr_request);
 
         let mut ent = Vec::new();
@@ -1084,20 +1090,24 @@ async fn op_open(
         _ => return Err(nfsstat4::NFS4ERR_SYMLINK.into()),
     }
 
-    use super::state::OpenOutcome;
-    let stateid = match context.nfs4_state.open(
-        args.owner.clientid,
-        &args.owner.owner,
-        args.seqid,
-        fileid,
-        acc,
-        args.share_deny & OPEN4_SHARE_DENY_BOTH,
-    ) {
-        OpenOutcome::Ok { stateid } => stateid,
-        OpenOutcome::StaleClientId => return Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
+    let mode = if wants_write || creating {
+        OpenMode::ReadWrite
+    } else {
+        OpenMode::ReadOnly
     };
 
-    state.current_fh = Some(context.vfs.id_to_fh(fileid));
+    use super::state::OpenOutcome;
+    let stateid = match context
+        .nfs4_state
+        .open(args.owner.clientid, &args.owner.owner, args.seqid, fileid, mode)
+        .await
+    {
+        OpenOutcome::Ok { stateid } => stateid,
+        OpenOutcome::StaleClientId => return Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
+        OpenOutcome::Err(stat) => return Err(stat.into()),
+    };
+
+    state.current_fh = Some(id_to_fh(&context.nfs4_state, fileid));
 
     // NFSv4.0: a fresh open owner must be confirmed via OPEN_CONFIRM before
     // its stateids are usable. 4.1 has no OPEN_CONFIRM.
@@ -1169,13 +1179,14 @@ async fn op_read(
     let fh = state.current_fh()?;
     let fh_fileid = fh_to_id(context, fh)?;
 
-    check_stateid(context, &args.stateid, fh_fileid, Need::Read)?;
+    let vfs_fh =
+        check_stateid(context, &args.stateid, fh_fileid, Need::Read)?.ok_or_else(|| nfsstat4::NFS4ERR_BADHANDLE)?;
 
-    debug!("OP_READ id={} offset={} count={}", fh_fileid, args.offset, args.count);
+    debug!("OP_READ id={} fh={} offset={} count={}", fh_fileid, *vfs_fh, args.offset, args.count);
 
     require_reg(context, fh_fileid).await?;
 
-    let (data, eof) = context.vfs.read(fh_fileid, args.offset, args.count).await?;
+    let (data, eof) = context.vfs.read(*vfs_fh, fh_fileid, args.offset, args.count).await?;
     let resok = READ4resok { eof, data };
 
     nfsstat4::NFS4_OK.serialize(op_out)?;
@@ -1200,13 +1211,17 @@ async fn op_write(
     let fh_fileid = fh_to_id(context, fh)?;
 
     require_writable(context)?;
-    check_stateid(context, &args.stateid, fh_fileid, Need::Write)?;
+    let vfs_fh =
+        check_stateid(context, &args.stateid, fh_fileid, Need::Write)?.ok_or_else(|| nfsstat4::NFS4ERR_BADHANDLE)?;
     require_reg(context, fh_fileid).await?;
 
     let write_len = args.data.len();
-    debug!("OP_WRITE id={} offset={} len={} stable={:?}", fh_fileid, args.offset, write_len, args.stable);
+    debug!(
+        "OP_WRITE id={} fh={} offset={} len={} stable={:?}",
+        fh_fileid, *vfs_fh, args.offset, write_len, args.stable
+    );
 
-    context.vfs.write(fh_fileid, args.offset, &args.data).await?;
+    context.vfs.write(*vfs_fh, fh_fileid, args.offset, &args.data).await?;
 
     let resok = WRITE4resok {
         count: write_len as count4,
@@ -1297,7 +1312,7 @@ async fn op_create(
         _ => return Err(nfsstat4::NFS4ERR_NOTSUPP.into()),
     };
 
-    state.current_fh = Some(context.vfs.id_to_fh(new_id));
+    state.current_fh = Some(id_to_fh(&context.nfs4_state, new_id));
     let after = change_after(context, dirid, before).await;
 
     let resok = CREATE4resok {

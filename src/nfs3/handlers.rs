@@ -8,9 +8,10 @@ use num_traits::cast::FromPrimitive;
 use tracing::{debug, error, trace, warn};
 
 use crate::context::RPCContext;
+use crate::nfs::{fh_to_id, id_to_fh};
 use crate::nfs3;
 use crate::rpc::*;
-use crate::vfs::VFSCapabilities;
+use crate::vfs::{OpenMode, VFSCapabilities};
 use crate::xdr::*;
 /*
 program NFS_PROGRAM {
@@ -195,7 +196,7 @@ pub async fn nfsproc3_getattr(
     handle.deserialize(input)?;
     debug!("nfsproc3_getattr({:?},{:?}) ", xid, handle);
 
-    let id = context.vfs.fh_to_id(&handle);
+    let id = fh_to_id(&context.nfs4_state, &handle);
     // fail if unable to convert file handle
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;
@@ -254,7 +255,7 @@ pub async fn nfsproc3_lookup(
     dirops.deserialize(input)?;
     debug!("nfsproc3_lookup({:?},{:?}) ", xid, dirops);
 
-    let dirid = context.vfs.fh_to_id(&dirops.dir);
+    let dirid = fh_to_id(&context.nfs4_state, &dirops.dir);
     // fail if unable to convert file handle
     if let Err(stat) = dirid {
         make_success_reply(xid).serialize(output)?;
@@ -278,7 +279,7 @@ pub async fn nfsproc3_lookup(
             debug!("lookup success {:?} --> {:?}", xid, obj_attr);
             make_success_reply(xid).serialize(output)?;
             nfs3::nfsstat3::NFS3_OK.serialize(output)?;
-            context.vfs.id_to_fh(fid).serialize(output)?;
+            id_to_fh(&context.nfs4_state, fid).serialize(output)?;
             obj_attr.serialize(output)?;
             dir_attr.serialize(output)?;
         },
@@ -347,7 +348,7 @@ pub async fn nfsproc3_read(
     args.deserialize(input)?;
     debug!("nfsproc3_read({:?},{:?}) ", xid, args);
 
-    let id = context.vfs.fh_to_id(&args.file);
+    let id = fh_to_id(&context.nfs4_state, &args.file);
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;
         stat.serialize(output)?;
@@ -360,7 +361,20 @@ pub async fn nfsproc3_read(
         Ok(v) => nfs3::post_op_attr::attributes(v),
         Err(_) => nfs3::post_op_attr::Void,
     };
-    match context.vfs.read(id, args.offset, args.count).await {
+
+    let vfs_fh = match context.vfs.open(id, OpenMode::ReadOnly).await {
+        Ok(fh) => fh,
+        Err(stat) => {
+            make_success_reply(xid).serialize(output)?;
+            stat.serialize(output)?;
+            nfs3::post_op_attr::Void.serialize(output)?;
+            return Ok(());
+        },
+    };
+
+    let res = context.vfs.read(vfs_fh, id, args.offset, args.count).await;
+    let _ = context.vfs.close(vfs_fh).await;
+    match res {
         Ok((bytes, eof)) => {
             let res = READ3resok {
                 file_attributes: obj_attr,
@@ -431,7 +445,7 @@ pub async fn nfsproc3_fsinfo(
     handle.deserialize(input)?;
     debug!("nfsproc3_fsinfo({:?},{:?}) ", xid, handle);
 
-    let id = context.vfs.fh_to_id(&handle);
+    let id = fh_to_id(&context.nfs4_state, &handle);
     // fail if unable to convert file handle
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;
@@ -502,7 +516,7 @@ pub async fn nfsproc3_access(
     access.deserialize(input)?;
     debug!("nfsproc3_access({:?},{:?},{:?})", xid, handle, access);
 
-    let id = context.vfs.fh_to_id(&handle);
+    let id = fh_to_id(&context.nfs4_state, &handle);
     // fail if unable to convert file handle
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;
@@ -588,7 +602,7 @@ pub async fn nfsproc3_pathconf(
     handle.deserialize(input)?;
     debug!("nfsproc3_pathconf({:?},{:?})", xid, handle);
 
-    let id = context.vfs.fh_to_id(&handle);
+    let id = fh_to_id(&context.nfs4_state, &handle);
     // fail if unable to convert file handle
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;
@@ -672,7 +686,7 @@ pub async fn nfsproc3_fsstat(
     let mut handle = nfs3::nfs_fh3::default();
     handle.deserialize(input)?;
     debug!("nfsproc3_fsstat({:?},{:?}) ", xid, handle);
-    let id = context.vfs.fh_to_id(&handle);
+    let id = fh_to_id(&context.nfs4_state, &handle);
     // fail if unable to convert file handle
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;
@@ -780,7 +794,7 @@ pub async fn nfsproc3_readdirplus(
     args.deserialize(input)?;
     debug!("nfsproc3_readdirplus({:?},{:?}) ", xid, args);
 
-    let dirid = context.vfs.fh_to_id(&args.dir);
+    let dirid = fh_to_id(&context.nfs4_state, &args.dir);
     // fail if unable to convert file handle
     if let Err(stat) = dirid {
         make_success_reply(xid).serialize(output)?;
@@ -888,7 +902,7 @@ pub async fn nfsproc3_readdirplus(
             dirversion.serialize(&mut counting_output)?;
             for entry in result.entries {
                 let obj_attr = entry.attr;
-                let handle = nfs3::post_op_fh3::handle(context.vfs.id_to_fh(entry.fileid));
+                let handle = nfs3::post_op_fh3::handle(id_to_fh(&context.nfs4_state, entry.fileid));
 
                 let entry = entryplus3 {
                     fileid: entry.fileid,
@@ -965,7 +979,7 @@ pub async fn nfsproc3_readdir(
     args.deserialize(input)?;
     debug!("nfsproc3_readdirplus({:?},{:?}) ", xid, args);
 
-    let dirid = context.vfs.fh_to_id(&args.dir);
+    let dirid = fh_to_id(&context.nfs4_state, &args.dir);
     // fail if unable to convert file handle
     if let Err(stat) = dirid {
         make_success_reply(xid).serialize(output)?;
@@ -1163,7 +1177,7 @@ pub async fn nfsproc3_write(
         return Ok(());
     }
 
-    let id = context.vfs.fh_to_id(&args.file);
+    let id = fh_to_id(&context.nfs4_state, &args.file);
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;
         stat.serialize(output)?;
@@ -1185,7 +1199,18 @@ pub async fn nfsproc3_write(
         Err(_) => nfs3::pre_op_attr::Void,
     };
 
-    match context.vfs.write(id, args.offset, &args.data).await {
+    let vfs_fh = match context.vfs.open(id, OpenMode::ReadWrite).await {
+        Ok(fh) => fh,
+        Err(stat) => {
+            make_success_reply(xid).serialize(output)?;
+            stat.serialize(output)?;
+            nfs3::post_op_attr::Void.serialize(output)?;
+            return Ok(());
+        },
+    };
+    let res = context.vfs.write(vfs_fh, id, args.offset, &args.data).await;
+    let _ = context.vfs.close(vfs_fh).await;
+    match res {
         Ok(fattr) => {
             debug!("write success {:?} --> {:?}", xid, fattr);
             let res = WRITE3resok {
@@ -1195,7 +1220,7 @@ pub async fn nfsproc3_write(
                 },
                 count: args.count,
                 committed: stable_how::FILE_SYNC,
-                verf: context.vfs.serverid(),
+                verf: context.nfs4_state.write_verifier(),
             };
             make_success_reply(xid).serialize(output)?;
             nfs3::nfsstat3::NFS3_OK.serialize(output)?;
@@ -1285,7 +1310,7 @@ pub async fn nfsproc3_create(
 
     // find the directory we are supposed to create the
     // new file in
-    let dirid = context.vfs.fh_to_id(&dirops.dir);
+    let dirid = fh_to_id(&context.nfs4_state, &dirops.dir);
     if let Err(stat) = dirid {
         // directory does not exist
         make_success_reply(xid).serialize(output)?;
@@ -1384,7 +1409,7 @@ pub async fn nfsproc3_create(
             make_success_reply(xid).serialize(output)?;
             nfs3::nfsstat3::NFS3_OK.serialize(output)?;
             // serialize CREATE3resok
-            let fh = context.vfs.id_to_fh(fid);
+            let fh = id_to_fh(&context.nfs4_state, fid);
             nfs3::post_op_fh3::handle(fh).serialize(output)?;
             postopattr.serialize(output)?;
             wcc_res.serialize(output)?;
@@ -1468,7 +1493,7 @@ pub async fn nfsproc3_setattr(
     args.deserialize(input)?;
     debug!("nfsproc3_setattr({:?},{:?}) ", xid, args);
 
-    let id = context.vfs.fh_to_id(&args.object);
+    let id = fh_to_id(&context.nfs4_state, &args.object);
     // fail if unable to convert file handle
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;
@@ -1575,7 +1600,7 @@ pub async fn nfsproc3_remove(
     debug!("nfsproc3_remove({:?}, {:?}) ", xid, dirops);
 
     // find the directory with the file
-    let dirid = context.vfs.fh_to_id(&dirops.dir);
+    let dirid = fh_to_id(&context.nfs4_state, &dirops.dir);
     if let Err(stat) = dirid {
         // directory does not exist
         make_success_reply(xid).serialize(output)?;
@@ -1686,7 +1711,7 @@ pub async fn nfsproc3_rename(
     debug!("nfsproc3_rename({:?}, {:?}, {:?}) ", xid, fromdirops, todirops);
 
     // find the from directory
-    let from_dirid = context.vfs.fh_to_id(&fromdirops.dir);
+    let from_dirid = fh_to_id(&context.nfs4_state, &fromdirops.dir);
     if let Err(stat) = from_dirid {
         // directory does not exist
         make_success_reply(xid).serialize(output)?;
@@ -1697,7 +1722,7 @@ pub async fn nfsproc3_rename(
     }
 
     // find the to directory
-    let to_dirid = context.vfs.fh_to_id(&todirops.dir);
+    let to_dirid = fh_to_id(&context.nfs4_state, &todirops.dir);
     if let Err(stat) = to_dirid {
         // directory does not exist
         make_success_reply(xid).serialize(output)?;
@@ -1848,7 +1873,7 @@ pub async fn nfsproc3_mkdir(
 
     // find the directory we are supposed to create the
     // new file in
-    let dirid = context.vfs.fh_to_id(&args.dirops.dir);
+    let dirid = fh_to_id(&context.nfs4_state, &args.dirops.dir);
     if let Err(stat) = dirid {
         // directory does not exist
         make_success_reply(xid).serialize(output)?;
@@ -1897,7 +1922,7 @@ pub async fn nfsproc3_mkdir(
             make_success_reply(xid).serialize(output)?;
             nfs3::nfsstat3::NFS3_OK.serialize(output)?;
             // serialize CREATE3resok
-            let fh = context.vfs.id_to_fh(fid);
+            let fh = id_to_fh(&context.nfs4_state, fid);
             nfs3::post_op_fh3::handle(fh).serialize(output)?;
             nfs3::post_op_attr::attributes(fattr).serialize(output)?;
             wcc_res.serialize(output)?;
@@ -1974,7 +1999,7 @@ pub async fn nfsproc3_symlink(
 
     // find the directory we are supposed to create the
     // new file in
-    let dirid = context.vfs.fh_to_id(&args.dirops.dir);
+    let dirid = fh_to_id(&context.nfs4_state, &args.dirops.dir);
     if let Err(stat) = dirid {
         // directory does not exist
         make_success_reply(xid).serialize(output)?;
@@ -2026,7 +2051,7 @@ pub async fn nfsproc3_symlink(
             make_success_reply(xid).serialize(output)?;
             nfs3::nfsstat3::NFS3_OK.serialize(output)?;
             // serialize CREATE3resok
-            let fh = context.vfs.id_to_fh(fid);
+            let fh = id_to_fh(&context.nfs4_state, fid);
             nfs3::post_op_fh3::handle(fh).serialize(output)?;
             nfs3::post_op_attr::attributes(fattr).serialize(output)?;
             wcc_res.serialize(output)?;
@@ -2077,7 +2102,7 @@ pub async fn nfsproc3_readlink(
     handle.deserialize(input)?;
     debug!("nfsproc3_readlink({:?},{:?}) ", xid, handle);
 
-    let id = context.vfs.fh_to_id(&handle);
+    let id = fh_to_id(&context.nfs4_state, &handle);
     // fail if unable to convert file handle
     if let Err(stat) = id {
         make_success_reply(xid).serialize(output)?;

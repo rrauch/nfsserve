@@ -13,7 +13,7 @@ use intaglio::Symbol;
 use nfsserve::fs_util::*;
 use nfsserve::nfs3::*;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use nfsserve::vfs::{vfs_fh, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tokio::fs::{File, OpenOptions};
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use tracing::debug;
@@ -338,7 +338,7 @@ impl NFSFileSystem for MirrorFS {
         Ok(ent.fsmeta)
     }
 
-    async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
+    async fn read(&self, _fh: vfs_fh, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
         let fsmap = self.fsmap.lock().await;
         let ent = fsmap.find_entry(id)?;
         let path = fsmap.sym_to_path(&ent.name).await;
@@ -429,7 +429,7 @@ impl NFSFileSystem for MirrorFS {
         }
         Ok(metadata_to_fattr3(id, &metadata))
     }
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+    async fn write(&self, _fh: vfs_fh, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         let fsmap = self.fsmap.lock().await;
         let ent = fsmap.find_entry(id)?;
         let path = fsmap.sym_to_path(&ent.name).await;

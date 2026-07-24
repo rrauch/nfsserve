@@ -4,7 +4,7 @@ use std::time::SystemTime;
 use async_trait::async_trait;
 use nfsserve::nfs3::{self, fattr3, fileid3, filename3, ftype3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3};
 use nfsserve::tcp::*;
-use nfsserve::vfs::{DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
+use nfsserve::vfs::{vfs_fh, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 
 #[derive(Debug, Clone)]
 enum FSContents {
@@ -124,7 +124,7 @@ impl NFSFileSystem for DemoFS {
         VFSCapabilities::ReadWrite
     }
 
-    async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
+    async fn write(&self, _fh: vfs_fh, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         {
             let mut fs = self.fs.lock().unwrap();
             let mut fssize = fs[id as usize].attr.size;
@@ -238,7 +238,7 @@ impl NFSFileSystem for DemoFS {
         Ok(entry.attr)
     }
 
-    async fn read(&self, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
+    async fn read(&self, _fh: vfs_fh, id: fileid3, offset: u64, count: u32) -> Result<(Vec<u8>, bool), nfsstat3> {
         let fs = self.fs.lock().unwrap();
         let entry = fs.get(id as usize).ok_or(nfsstat3::NFS3ERR_NOENT)?;
         if let FSContents::Directory(_) = entry.contents {
