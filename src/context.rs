@@ -1,7 +1,7 @@
 use std::fmt;
 use std::sync::Arc;
 
-use crate::nfs4_state::NFS4State;
+use crate::nfs4::NFS4State;
 use crate::transaction_tracker::TransactionTracker;
 use crate::vfs::NFSFileSystem;
 use tokio::sync::mpsc;

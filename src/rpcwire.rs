@@ -8,7 +8,7 @@ use tracing::{debug, error, trace, warn};
 use crate::context::RPCContext;
 use crate::rpc::*;
 use crate::xdr::*;
-use crate::{mount, mount_handlers, nfs, nfs3, nfs3_handlers, nfs4, nfs4_handlers, portmap, portmap_handlers};
+use crate::{mount, mount_handlers, nfs, nfs3, nfs4, portmap, portmap_handlers};
 
 // Information from RFC 5531
 // https://datatracker.ietf.org/doc/html/rfc5531
@@ -47,9 +47,9 @@ async fn handle_rpc(
         let res = {
             if call.prog == nfs::PROGRAM {
                 if call.vers == nfs3::VERSION {
-                    nfs3_handlers::handle_nfs(xid, call, input, output, &context).await
+                    nfs3::handle_nfs(xid, call, input, output, &context).await
                 } else if call.vers == nfs4::VERSION {
-                    nfs4_handlers::handle_nfs(xid, call, input, output, &context).await
+                    nfs4::handle_nfs(xid, call, input, output, &context).await
                 } else {
                     prog_mismatch_reply_message(xid, nfs3::VERSION, nfs4::VERSION).serialize(output)?;
                     return Ok(true);

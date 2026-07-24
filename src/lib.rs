@@ -12,16 +12,12 @@ mod mount_handlers;
 mod portmap;
 mod portmap_handlers;
 
-pub mod nfs3;
-mod nfs3_handlers;
-
 #[cfg(not(target_os = "windows"))]
 pub mod fs_util;
 
+pub mod nfs;
+pub mod nfs3;
+pub mod nfs4;
 pub mod tcp;
 mod transaction_tracker;
 pub mod vfs;
-mod nfs;
-mod nfs4_handlers;
-mod nfs4;
-mod nfs4_state;

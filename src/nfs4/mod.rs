@@ -1,6 +1,12 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
+mod handlers;
+mod state;
+
+pub(crate) use handlers::handle_nfs;
+pub(crate) use state::NFS4State;
+
 use crate::nfs::{nfs_fh, nfsstring, opaque, specdata};
 use crate::xdr::*;
 use crate::{nfs3, xdr_enum_serde, xdr_struct};
@@ -17,14 +23,13 @@ use std::num::TryFromIntError;
 pub const VERSION: u32 = 4;
 
 // ---- Sizes ----
-pub const NFS4_FHSIZE: u32 = 128;
-pub const NFS4_VERIFIER_SIZE: usize = 8;
-pub const NFS4_OTHER_SIZE: usize = 12;
-pub const NFS4_SESSIONID_SIZE: usize = 16;
-pub const NFS4_LEASE_TIME: u32 = 90;
+const NFS4_VERIFIER_SIZE: usize = 8;
+const NFS4_OTHER_SIZE: usize = 12;
+const NFS4_SESSIONID_SIZE: usize = 16;
+pub(crate) const NFS4_LEASE_TIME: u32 = 90;
 
-pub const MAX_REQUEST_SIZE: u32 = 1 << 20;
-pub const MAX_RESPONSE_SIZE: u32 = 1 << 20;
+const MAX_REQUEST_SIZE: u32 = 1 << 20;
+const MAX_RESPONSE_SIZE: u32 = 1 << 20;
 
 // ---- Basic type aliases ----
 pub type filename4 = nfsstring;
@@ -507,7 +512,7 @@ pub struct fattr4 {
 }
 
 impl fattr4 {
-    pub fn from_v3(fattr: &fattr3, fsinfo: &fsinfo3) -> fattr4 {
+    fn from_v3(fattr: &fattr3, fsinfo: &fsinfo3) -> fattr4 {
         Self {
             supported_attrs: Some(Vec::from(SUPPORTED_ATTRS)),
             ftype: Some(ftype4::from(fattr.ftype)),
@@ -577,7 +582,7 @@ impl fattr4 {
 
     /// Clear any attribute whose bit is not set in `req`.
     /// Bit numbering matches the ascending order used in serialize().
-    pub fn retain_requested(&mut self, req: &bitmap4) {
+    fn retain_requested(&mut self, req: &bitmap4) {
         let is_req = |bit: usize| -> bool {
             let w = bit / 32;
             w < req.len() && (req[w] & (1 << (bit % 32))) != 0
@@ -642,7 +647,7 @@ impl fattr4 {
     ///   (sattr3, attrs_set_bitmap, Err(unsupported_bit))
     /// If a requested-to-set attribute isn't supported, returns the offending
     /// bit so the caller can emit NFS4ERR_ATTRNOTSUPP with the attrs set so far.
-    pub fn to_sattr3(&self) -> Result<(crate::nfs3::sattr3, bitmap4), usize> {
+    fn to_sattr3(&self) -> Result<(crate::nfs3::sattr3, bitmap4), usize> {
         use crate::nfs3::{sattr3, set_atime, set_mode3, set_mtime, set_size3};
 
         let mut s = sattr3::default();
@@ -1005,19 +1010,19 @@ impl TryFrom<nfstime4> for nfstime3 {
 
 // ---- EXCHANGE_ID (RFC 8881 §18.35) ----
 
-pub const EXCHGID4_FLAG_SUPP_MOVED_REFER: u32 = 0x00000001;
-pub const EXCHGID4_FLAG_SUPP_MOVED_MIGR: u32 = 0x00000002;
-pub const EXCHGID4_FLAG_BIND_PRINC_STATEID: u32 = 0x00000100;
-pub const EXCHGID4_FLAG_USE_NON_PNFS: u32 = 0x00010000;
-pub const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x00020000;
-pub const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x00040000;
-pub const EXCHGID4_FLAG_MASK_PNFS: u32 = 0x00070000;
-pub const EXCHGID4_FLAG_UPD_CONFIRMED_REC_A: u32 = 0x40000000;
-pub const EXCHGID4_FLAG_CONFIRMED_R: u32 = 0x80000000;
+const EXCHGID4_FLAG_SUPP_MOVED_REFER: u32 = 0x00000001;
+const EXCHGID4_FLAG_SUPP_MOVED_MIGR: u32 = 0x00000002;
+const EXCHGID4_FLAG_BIND_PRINC_STATEID: u32 = 0x00000100;
+const EXCHGID4_FLAG_USE_NON_PNFS: u32 = 0x00010000;
+const EXCHGID4_FLAG_USE_PNFS_MDS: u32 = 0x00020000;
+const EXCHGID4_FLAG_USE_PNFS_DS: u32 = 0x00040000;
+const EXCHGID4_FLAG_MASK_PNFS: u32 = 0x00070000;
+const EXCHGID4_FLAG_UPD_CONFIRMED_REC_A: u32 = 0x40000000;
+const EXCHGID4_FLAG_CONFIRMED_R: u32 = 0x80000000;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
-pub enum state_protect_how4 {
+enum state_protect_how4 {
     SP4_NONE = 0,
     SP4_MACH_CRED = 1,
     SP4_SSV = 2,
@@ -1081,11 +1086,11 @@ impl XDR for impl_id_optional {
 /// state_protect4_a — only SP4_NONE decoded fully.
 /// SP4_MACH_CRED / SP4_SSV are decoded enough to stay stream-aligned.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct state_protect4_a {
-    pub spa_how: state_protect_how4,
+struct state_protect4_a {
+    spa_how: state_protect_how4,
     // For SP4_MACH_CRED/SP4_SSV we hold the raw opaque tail so we stay aligned.
-    pub spa_mach_ops: Option<(bitmap4, bitmap4)>, // enforce, allow (MACH_CRED)
-    pub spa_ssv: Option<ssv_sp_parms4>,           // SSV
+    spa_mach_ops: Option<(bitmap4, bitmap4)>, // enforce, allow (MACH_CRED)
+    spa_ssv: Option<ssv_sp_parms4>,           // SSV
 }
 impl XDR for state_protect4_a {
     fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
@@ -1148,25 +1153,25 @@ xdr_struct!(
 
 /// state_protect4_r — server reply. We only ever return SP4_NONE.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct state_protect4_r {
-    pub spr_how: state_protect_how4,
+struct state_protect4_r {
+    spr_how: state_protect_how4,
     // SP4_NONE => nothing further.
 }
 xdr_struct!(state_protect4_r, spr_how);
 
 // EXCHANGE_ID4args
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct EXCHANGE_ID4args {
-    pub eia_clientowner: client_owner4,
-    pub eia_flags: u32,
-    pub eia_state_protect: state_protect4_a,
-    pub eia_client_impl_id: impl_id_optional,
+struct EXCHANGE_ID4args {
+    eia_clientowner: client_owner4,
+    eia_flags: u32,
+    eia_state_protect: state_protect4_a,
+    eia_client_impl_id: impl_id_optional,
 }
 xdr_struct!(EXCHANGE_ID4args, eia_clientowner, eia_flags, eia_state_protect, eia_client_impl_id);
 
 // server_owner4
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct server_owner4 {
+struct server_owner4 {
     pub so_minor_id: u64,
     pub so_major_id: Vec<u8>,
 }
@@ -1174,14 +1179,14 @@ xdr_struct!(server_owner4, so_minor_id, so_major_id);
 
 // EXCHANGE_ID4resok
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct EXCHANGE_ID4resok {
-    pub eir_clientid: clientid4,
-    pub eir_sequenceid: sequenceid4,
-    pub eir_flags: u32,
-    pub eir_state_protect: state_protect4_r,
-    pub eir_server_owner: server_owner4,
-    pub eir_server_scope: Vec<u8>,
-    pub eir_server_impl_id: impl_id_optional,
+struct EXCHANGE_ID4resok {
+    eir_clientid: clientid4,
+    eir_sequenceid: sequenceid4,
+    eir_flags: u32,
+    eir_state_protect: state_protect4_r,
+    eir_server_owner: server_owner4,
+    eir_server_scope: Vec<u8>,
+    eir_server_impl_id: impl_id_optional,
 }
 xdr_struct!(
     EXCHANGE_ID4resok,
@@ -1198,16 +1203,16 @@ xdr_struct!(
 
 /// clientaddr4: universal-address netid + addr (RFC 7530 §2.2.9).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct clientaddr4 {
-    pub r_netid: nfsstring,
-    pub r_addr: nfsstring,
+struct clientaddr4 {
+    r_netid: nfsstring,
+    r_addr: nfsstring,
 }
 xdr_struct!(clientaddr4, r_netid, r_addr);
 
 /// cb_client4: callback program + location. We never call back, but must
 /// decode it to stay stream-aligned.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct cb_client4 {
+struct cb_client4 {
     pub cb_program: u32,
     pub cb_location: clientaddr4,
 }
@@ -1215,89 +1220,89 @@ xdr_struct!(cb_client4, cb_program, cb_location);
 
 /// nfs_client_id4: verifier + opaque client id (RFC 7530 §16.33).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct nfs_client_id4 {
-    pub verifier: verifier4,
-    pub id: Vec<u8>,
+struct nfs_client_id4 {
+    verifier: verifier4,
+    id: Vec<u8>,
 }
 xdr_struct!(nfs_client_id4, verifier, id);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SETCLIENTID4args {
-    pub client: nfs_client_id4,
-    pub callback: cb_client4,
-    pub callback_ident: u32,
+struct SETCLIENTID4args {
+    client: nfs_client_id4,
+    callback: cb_client4,
+    callback_ident: u32,
 }
 xdr_struct!(SETCLIENTID4args, client, callback, callback_ident);
 
 /// SETCLIENTID4resok (the NFS4_OK arm). The NFS4ERR_CLID_INUSE arm carries a
 /// clientaddr4 instead; we never emit it in this lean impl.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SETCLIENTID4resok {
-    pub clientid: clientid4,
-    pub setclientid_confirm: verifier4,
+struct SETCLIENTID4resok {
+    clientid: clientid4,
+    setclientid_confirm: verifier4,
 }
 xdr_struct!(SETCLIENTID4resok, clientid, setclientid_confirm);
 
 // ---- SETCLIENTID_CONFIRM (NFSv4.0, RFC 7530 §16.34) ----
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SETCLIENTID_CONFIRM4args {
-    pub clientid: clientid4,
-    pub setclientid_confirm: verifier4,
+struct SETCLIENTID_CONFIRM4args {
+    clientid: clientid4,
+    setclientid_confirm: verifier4,
 }
 xdr_struct!(SETCLIENTID_CONFIRM4args, clientid, setclientid_confirm);
 
 // ---- RENEW (NFSv4.0, RFC 7530 §16.30) ----
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RENEW4args {
-    pub clientid: clientid4,
+struct RENEW4args {
+    clientid: clientid4,
 }
 xdr_struct!(RENEW4args, clientid);
 
 // ---- OPEN_CONFIRM (NFSv4.0, RFC 7530 §16.18) ----
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OPEN_CONFIRM4args {
-    pub open_stateid: stateid4,
-    pub seqid: seqid4,
+struct OPEN_CONFIRM4args {
+    open_stateid: stateid4,
+    seqid: seqid4,
 }
 xdr_struct!(OPEN_CONFIRM4args, open_stateid, seqid);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct OPEN_CONFIRM4resok {
-    pub open_stateid: stateid4,
+struct OPEN_CONFIRM4resok {
+    open_stateid: stateid4,
 }
 xdr_struct!(OPEN_CONFIRM4resok, open_stateid);
 
 // ---- RELEASE_LOCKOWNER (NFSv4.0, RFC 7530 §16.37) ----
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct lock_owner4 {
-    pub clientid: clientid4,
-    pub owner: Vec<u8>,
+struct lock_owner4 {
+    clientid: clientid4,
+    owner: Vec<u8>,
 }
 xdr_struct!(lock_owner4, clientid, owner);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RELEASE_LOCKOWNER4args {
-    pub lock_owner: lock_owner4,
+struct RELEASE_LOCKOWNER4args {
+    lock_owner: lock_owner4,
 }
 xdr_struct!(RELEASE_LOCKOWNER4args, lock_owner);
 
 // ---- CREATE_SESSION (RFC 8881 §18.36) ----
 
-pub const CREATE_SESSION4_FLAG_PERSIST: u32 = 0x00000001;
-pub const CREATE_SESSION4_FLAG_CONN_BACK_CHAN: u32 = 0x00000002;
-pub const CREATE_SESSION4_FLAG_CONN_RDMA: u32 = 0x00000004;
+const CREATE_SESSION4_FLAG_PERSIST: u32 = 0x00000001;
+const CREATE_SESSION4_FLAG_CONN_BACK_CHAN: u32 = 0x00000002;
+const CREATE_SESSION4_FLAG_CONN_RDMA: u32 = 0x00000004;
 
 /// channel_attrs4 (RFC 8881 §18.36).
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct channel_attrs4 {
-    pub ca_headerpadsize: count4,
-    pub ca_maxrequestsize: count4,
-    pub ca_maxresponsesize: count4,
-    pub ca_maxresponsesize_cached: count4,
-    pub ca_maxoperations: count4,
-    pub ca_maxrequests: count4,
+struct channel_attrs4 {
+    ca_headerpadsize: count4,
+    ca_maxrequestsize: count4,
+    ca_maxresponsesize: count4,
+    ca_maxresponsesize_cached: count4,
+    ca_maxoperations: count4,
+    ca_maxrequests: count4,
     /// rdma_ird<0..1> — optional array of one u32.
-    pub ca_rdma_ird: Vec<u32>,
+    ca_rdma_ird: Vec<u32>,
 }
 xdr_struct!(
     channel_attrs4,
@@ -1311,11 +1316,11 @@ xdr_struct!(
 );
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct callback_sec_parms4 {
-    pub cb_secflavor: u32,
+struct callback_sec_parms4 {
+    cb_secflavor: u32,
     /// AUTH_SYS body (authsys_parms) or raw GSS body, kept for alignment.
-    pub cb_sys: Option<cbsp_authsys>,
-    pub cb_gss_raw: Option<Vec<u8>>, // not parsed; we reject GSS anyway
+    cb_sys: Option<cbsp_authsys>,
+    cb_gss_raw: Option<Vec<u8>>, // not parsed; we reject GSS anyway
 }
 impl XDR for callback_sec_parms4 {
     fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
@@ -1389,24 +1394,24 @@ impl XDR for Vec<callback_sec_parms4> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct cbsp_authsys {
-    pub stamp: u32,
-    pub machinename: nfsstring,
-    pub uid: u32,
-    pub gid: u32,
-    pub gids: Vec<u32>,
+struct cbsp_authsys {
+    stamp: u32,
+    machinename: nfsstring,
+    uid: u32,
+    gid: u32,
+    gids: Vec<u32>,
 }
 xdr_struct!(cbsp_authsys, stamp, machinename, uid, gid, gids);
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct CREATE_SESSION4args {
-    pub csa_clientid: clientid4,
-    pub csa_sequence: sequenceid4,
-    pub csa_flags: u32,
-    pub csa_fore_chan_attrs: channel_attrs4,
-    pub csa_back_chan_attrs: channel_attrs4,
-    pub csa_cb_program: u32,
-    pub csa_sec_parms: Vec<callback_sec_parms4>,
+struct CREATE_SESSION4args {
+    csa_clientid: clientid4,
+    csa_sequence: sequenceid4,
+    csa_flags: u32,
+    csa_fore_chan_attrs: channel_attrs4,
+    csa_back_chan_attrs: channel_attrs4,
+    csa_cb_program: u32,
+    csa_sec_parms: Vec<callback_sec_parms4>,
 }
 xdr_struct!(
     CREATE_SESSION4args,
@@ -1420,12 +1425,12 @@ xdr_struct!(
 );
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct CREATE_SESSION4resok {
-    pub csr_sessionid: sessionid4,
-    pub csr_sequence: sequenceid4,
-    pub csr_flags: u32,
-    pub csr_fore_chan_attrs: channel_attrs4,
-    pub csr_back_chan_attrs: channel_attrs4,
+struct CREATE_SESSION4resok {
+    csr_sessionid: sessionid4,
+    csr_sequence: sequenceid4,
+    csr_flags: u32,
+    csr_fore_chan_attrs: channel_attrs4,
+    csr_back_chan_attrs: channel_attrs4,
 }
 xdr_struct!(
     CREATE_SESSION4resok,
@@ -1439,53 +1444,53 @@ xdr_struct!(
 // ---- DESTROY_SESSION (RFC 8881 §18.37) ----
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DESTROY_SESSION4args {
-    pub dsa_sessionid: sessionid4,
+struct DESTROY_SESSION4args {
+    dsa_sessionid: sessionid4,
 }
 xdr_struct!(DESTROY_SESSION4args, dsa_sessionid);
 
 // ---- DESTROY_CLIENTID (RFC 8881 §18.50) ----
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct DESTROY_CLIENTID4args {
-    pub dca_clientid: clientid4,
+struct DESTROY_CLIENTID4args {
+    dca_clientid: clientid4,
 }
 xdr_struct!(DESTROY_CLIENTID4args, dca_clientid);
 
 // ---- SEQUENCE (RFC 8881 §18.46) ----
 
-pub const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x00000001;
-pub const SEQ4_STATUS_CB_GSS_CONTEXTS_EXPIRING: u32 = 0x00000002;
-pub const SEQ4_STATUS_CB_GSS_CONTEXTS_EXPIRED: u32 = 0x00000004;
-pub const SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED: u32 = 0x00000008;
-pub const SEQ4_STATUS_EXPIRED_SOME_STATE_REVOKED: u32 = 0x00000010;
-pub const SEQ4_STATUS_ADMIN_STATE_REVOKED: u32 = 0x00000020;
-pub const SEQ4_STATUS_RECALLABLE_STATE_REVOKED: u32 = 0x00000040;
-pub const SEQ4_STATUS_LEASE_MOVED: u32 = 0x00000080;
-pub const SEQ4_STATUS_RESTART_RECLAIM_NEEDED: u32 = 0x00000100;
-pub const SEQ4_STATUS_CB_PATH_DOWN_SESSION: u32 = 0x00000200;
-pub const SEQ4_STATUS_BACKCHANNEL_FAULT: u32 = 0x00000400;
-pub const SEQ4_STATUS_DEVID_CHANGED: u32 = 0x00000800;
-pub const SEQ4_STATUS_DEVID_DELETED: u32 = 0x00001000;
+const SEQ4_STATUS_CB_PATH_DOWN: u32 = 0x00000001;
+const SEQ4_STATUS_CB_GSS_CONTEXTS_EXPIRING: u32 = 0x00000002;
+const SEQ4_STATUS_CB_GSS_CONTEXTS_EXPIRED: u32 = 0x00000004;
+const SEQ4_STATUS_EXPIRED_ALL_STATE_REVOKED: u32 = 0x00000008;
+const SEQ4_STATUS_EXPIRED_SOME_STATE_REVOKED: u32 = 0x00000010;
+const SEQ4_STATUS_ADMIN_STATE_REVOKED: u32 = 0x00000020;
+const SEQ4_STATUS_RECALLABLE_STATE_REVOKED: u32 = 0x00000040;
+const SEQ4_STATUS_LEASE_MOVED: u32 = 0x00000080;
+const SEQ4_STATUS_RESTART_RECLAIM_NEEDED: u32 = 0x00000100;
+const SEQ4_STATUS_CB_PATH_DOWN_SESSION: u32 = 0x00000200;
+const SEQ4_STATUS_BACKCHANNEL_FAULT: u32 = 0x00000400;
+const SEQ4_STATUS_DEVID_CHANGED: u32 = 0x00000800;
+const SEQ4_STATUS_DEVID_DELETED: u32 = 0x00001000;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SEQUENCE4args {
-    pub sa_sessionid: sessionid4,
-    pub sa_sequenceid: sequenceid4,
-    pub sa_slotid: slotid4,
-    pub sa_highest_slotid: slotid4,
-    pub sa_cachethis: bool,
+struct SEQUENCE4args {
+    sa_sessionid: sessionid4,
+    sa_sequenceid: sequenceid4,
+    sa_slotid: slotid4,
+    sa_highest_slotid: slotid4,
+    sa_cachethis: bool,
 }
 xdr_struct!(SEQUENCE4args, sa_sessionid, sa_sequenceid, sa_slotid, sa_highest_slotid, sa_cachethis);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SEQUENCE4resok {
-    pub sr_sessionid: sessionid4,
-    pub sr_sequenceid: sequenceid4,
-    pub sr_slotid: slotid4,
-    pub sr_highest_slotid: slotid4,
-    pub sr_target_highest_slotid: slotid4,
-    pub sr_status_flags: u32,
+struct SEQUENCE4resok {
+    sr_sessionid: sessionid4,
+    sr_sequenceid: sequenceid4,
+    sr_slotid: slotid4,
+    sr_highest_slotid: slotid4,
+    sr_target_highest_slotid: slotid4,
+    sr_status_flags: u32,
 }
 xdr_struct!(
     SEQUENCE4resok,
@@ -1498,82 +1503,82 @@ xdr_struct!(
 );
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct GETATTR4args {
-    pub attr_request: bitmap4,
+struct GETATTR4args {
+    attr_request: bitmap4,
 }
 xdr_struct!(GETATTR4args, attr_request);
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct PUTFH4args {
-    pub object: nfs_fh4,
+struct PUTFH4args {
+    object: nfs_fh4,
 }
 xdr_struct!(PUTFH4args, object);
 
 // ---- ACCESS (RFC 8881 §18.1) ----
-pub const ACCESS4_READ: u32 = 0x00000001;
-pub const ACCESS4_LOOKUP: u32 = 0x00000002;
-pub const ACCESS4_MODIFY: u32 = 0x00000004;
-pub const ACCESS4_EXTEND: u32 = 0x00000008;
-pub const ACCESS4_DELETE: u32 = 0x00000010;
-pub const ACCESS4_EXECUTE: u32 = 0x00000020;
+const ACCESS4_READ: u32 = 0x00000001;
+const ACCESS4_LOOKUP: u32 = 0x00000002;
+const ACCESS4_MODIFY: u32 = 0x00000004;
+const ACCESS4_EXTEND: u32 = 0x00000008;
+const ACCESS4_DELETE: u32 = 0x00000010;
+const ACCESS4_EXECUTE: u32 = 0x00000020;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ACCESS4args {
-    pub access: u32,
+struct ACCESS4args {
+    access: u32,
 }
 xdr_struct!(ACCESS4args, access);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct ACCESS4resok {
-    pub supported: u32,
-    pub access: u32,
+struct ACCESS4resok {
+    supported: u32,
+    access: u32,
 }
 xdr_struct!(ACCESS4resok, supported, access);
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct LOOKUP4args {
-    pub objname: component4,
+struct LOOKUP4args {
+    objname: component4,
 }
 xdr_struct!(LOOKUP4args, objname);
 
 // ---- READDIR (RFC 8881 §18.23) ----
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct READDIR4args {
-    pub cookie: nfs_cookie4,
-    pub cookieverf: verifier4,
-    pub dircount: count4,
-    pub maxcount: count4,
-    pub attr_request: bitmap4,
+struct READDIR4args {
+    cookie: nfs_cookie4,
+    cookieverf: verifier4,
+    dircount: count4,
+    maxcount: count4,
+    attr_request: bitmap4,
 }
 xdr_struct!(READDIR4args, cookie, cookieverf, dircount, maxcount, attr_request);
 
 // ---- stateid4 (RFC 8881 §3.2) ----
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct stateid4 {
-    pub seqid: u32,
-    pub other: [u8; NFS4_OTHER_SIZE],
+struct stateid4 {
+    seqid: u32,
+    other: [u8; NFS4_OTHER_SIZE],
 }
 xdr_struct!(stateid4, seqid, other);
 
 // ---- OPEN (RFC 8881 §18.16) ----
 
 // share_access / share_deny
-pub const OPEN4_SHARE_ACCESS_READ: u32 = 0x00000001;
-pub const OPEN4_SHARE_ACCESS_WRITE: u32 = 0x00000002;
-pub const OPEN4_SHARE_ACCESS_BOTH: u32 = 0x00000003;
-pub const OPEN4_SHARE_DENY_NONE: u32 = 0x00000000;
-pub const OPEN4_SHARE_DENY_READ: u32 = 0x00000001;
-pub const OPEN4_SHARE_DENY_WRITE: u32 = 0x00000002;
-pub const OPEN4_SHARE_DENY_BOTH: u32 = 0x00000003;
+const OPEN4_SHARE_ACCESS_READ: u32 = 0x00000001;
+const OPEN4_SHARE_ACCESS_WRITE: u32 = 0x00000002;
+const OPEN4_SHARE_ACCESS_BOTH: u32 = 0x00000003;
+const OPEN4_SHARE_DENY_NONE: u32 = 0x00000000;
+const OPEN4_SHARE_DENY_READ: u32 = 0x00000001;
+const OPEN4_SHARE_DENY_WRITE: u32 = 0x00000002;
+const OPEN4_SHARE_DENY_BOTH: u32 = 0x00000003;
 
 // rflags
-pub const OPEN4_RESULT_CONFIRM: u32 = 0x00000002;
-pub const OPEN4_RESULT_LOCKTYPE_POSIX: u32 = 0x00000004;
+const OPEN4_RESULT_CONFIRM: u32 = 0x00000002;
+const OPEN4_RESULT_LOCKTYPE_POSIX: u32 = 0x00000004;
 
 // opentype4
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
-pub enum opentype4 {
+enum opentype4 {
     #[default]
     OPEN4_NOCREATE = 0,
     OPEN4_CREATE = 1,
@@ -1583,7 +1588,7 @@ xdr_enum_serde!(opentype4);
 // createmode4
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
-pub enum createmode4 {
+enum createmode4 {
     #[default]
     UNCHECKED4 = 0,
     GUARDED4 = 1,
@@ -1597,10 +1602,10 @@ xdr_enum_serde!(createmode4);
 /// EXCLUSIVE4 carries verifier4; EXCLUSIVE4_1 carries creatverfattr.
 /// We decode enough to stay aligned but only act on UNCHECKED4.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct createhow4 {
-    pub mode: createmode4,
-    pub createattrs: fattr4,   // UNCHECKED4 / GUARDED4
-    pub createverf: verifier4, // EXCLUSIVE4 / EXCLUSIVE4_1
+struct createhow4 {
+    mode: createmode4,
+    createattrs: fattr4,   // UNCHECKED4 / GUARDED4
+    createverf: verifier4, // EXCLUSIVE4 / EXCLUSIVE4_1
 }
 impl XDR for createhow4 {
     fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
@@ -1639,9 +1644,9 @@ impl XDR for createhow4 {
 
 /// openflag4 union switched on opentype4.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct openflag4 {
-    pub opentype: opentype4,
-    pub how: createhow4, // only meaningful when opentype == OPEN4_CREATE
+struct openflag4 {
+    opentype: opentype4,
+    how: createhow4, // only meaningful when opentype == OPEN4_CREATE
 }
 impl XDR for openflag4 {
     fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
@@ -1663,7 +1668,7 @@ impl XDR for openflag4 {
 // open_claim_type4
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
-pub enum open_claim_type4 {
+enum open_claim_type4 {
     #[default]
     CLAIM_NULL = 0,
     CLAIM_PREVIOUS = 1,
@@ -1679,12 +1684,12 @@ xdr_enum_serde!(open_claim_type4);
 /// Other claim types are decoded just enough to stay aligned; the handler
 /// rejects them with NFS4ERR_NOTSUPP.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct open_claim4 {
-    pub claim: open_claim_type4,
-    pub file: component4,                             // CLAIM_NULL
-    pub delegate_type: u32,                           // CLAIM_PREVIOUS (open_delegation_type4)
-    pub delegate_cur: Option<(stateid4, component4)>, // CLAIM_DELEGATE_CUR
-    pub delegate_prev_file: component4,               // CLAIM_DELEGATE_PREV
+struct open_claim4 {
+    claim: open_claim_type4,
+    file: component4,                             // CLAIM_NULL
+    delegate_type: u32,                           // CLAIM_PREVIOUS (open_delegation_type4)
+    delegate_cur: Option<(stateid4, component4)>, // CLAIM_DELEGATE_CUR
+    delegate_prev_file: component4,               // CLAIM_DELEGATE_PREV
 }
 impl XDR for open_claim4 {
     fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
@@ -1724,35 +1729,35 @@ impl XDR for open_claim4 {
 
 // open_owner4
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct open_owner4 {
-    pub clientid: clientid4,
-    pub owner: Vec<u8>,
+struct open_owner4 {
+    clientid: clientid4,
+    owner: Vec<u8>,
 }
 xdr_struct!(open_owner4, clientid, owner);
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct OPEN4args {
-    pub seqid: seqid4,
-    pub share_access: u32,
-    pub share_deny: u32,
-    pub owner: open_owner4,
-    pub openhow: openflag4,
-    pub claim: open_claim4,
+struct OPEN4args {
+    seqid: seqid4,
+    share_access: u32,
+    share_deny: u32,
+    owner: open_owner4,
+    openhow: openflag4,
+    claim: open_claim4,
 }
 xdr_struct!(OPEN4args, seqid, share_access, share_deny, owner, openhow, claim);
 
 // change_info4
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub struct change_info4 {
-    pub atomic: bool,
-    pub before: changeid4,
-    pub after: changeid4,
+struct change_info4 {
+    atomic: bool,
+    before: changeid4,
+    after: changeid4,
 }
 xdr_struct!(change_info4, atomic, before, after);
 
 // open_delegation4 — we always emit OPEN_DELEGATE_NONE (0).
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct open_delegation4_none;
+struct open_delegation4_none;
 impl XDR for open_delegation4_none {
     fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
         0u32.serialize(dest) // OPEN_DELEGATE_NONE
@@ -1763,43 +1768,43 @@ impl XDR for open_delegation4_none {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct OPEN4resok {
-    pub stateid: stateid4,
-    pub cinfo: change_info4,
-    pub rflags: u32,
-    pub attrset: bitmap4,
-    pub delegation: open_delegation4_none,
+struct OPEN4resok {
+    stateid: stateid4,
+    cinfo: change_info4,
+    rflags: u32,
+    attrset: bitmap4,
+    delegation: open_delegation4_none,
 }
 xdr_struct!(OPEN4resok, stateid, cinfo, rflags, attrset, delegation);
 
 // ---- CLOSE (RFC 8881 §18.2) ----
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct CLOSE4args {
-    pub seqid: seqid4,
-    pub open_stateid: stateid4,
+struct CLOSE4args {
+    seqid: seqid4,
+    open_stateid: stateid4,
 }
 xdr_struct!(CLOSE4args, seqid, open_stateid);
 
 // ---- READ (RFC 8881 §18.22) ----
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct READ4args {
-    pub stateid: stateid4,
-    pub offset: offset4,
-    pub count: count4,
+struct READ4args {
+    stateid: stateid4,
+    offset: offset4,
+    count: count4,
 }
 xdr_struct!(READ4args, stateid, offset, count);
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct READ4resok {
-    pub eof: bool,
-    pub data: Vec<u8>,
+struct READ4resok {
+    eof: bool,
+    data: Vec<u8>,
 }
 xdr_struct!(READ4resok, eof, data);
 
 // ---- WRITE (RFC 8881 §18.32) ----
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
-pub enum stable_how4 {
+enum stable_how4 {
     #[default]
     UNSTABLE4 = 0,
     DATA_SYNC4 = 1,
@@ -1808,32 +1813,32 @@ pub enum stable_how4 {
 xdr_enum_serde!(stable_how4);
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct WRITE4args {
-    pub stateid: stateid4,
-    pub offset: offset4,
-    pub stable: stable_how4,
-    pub data: Vec<u8>,
+struct WRITE4args {
+    stateid: stateid4,
+    offset: offset4,
+    stable: stable_how4,
+    data: Vec<u8>,
 }
 xdr_struct!(WRITE4args, stateid, offset, stable, data);
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct WRITE4resok {
-    pub count: count4,
-    pub committed: stable_how4,
-    pub writeverf: verifier4,
+struct WRITE4resok {
+    count: count4,
+    committed: stable_how4,
+    writeverf: verifier4,
 }
 xdr_struct!(WRITE4resok, count, committed, writeverf);
 
 // ---- REMOVE (RFC 8881 §18.25) ----
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct REMOVE4args {
-    pub target: component4,
+struct REMOVE4args {
+    target: component4,
 }
 xdr_struct!(REMOVE4args, target);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct REMOVE4resok {
-    pub cinfo: change_info4,
+struct REMOVE4resok {
+    cinfo: change_info4,
 }
 xdr_struct!(REMOVE4resok, cinfo);
 
@@ -1844,10 +1849,10 @@ xdr_struct!(REMOVE4resok, cinfo);
 /// SOCK/FIFO are void. We decode all variants to stay aligned but only act
 /// on DIR and LNK.
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct createtype4 {
-    pub ftype: ftype4,
-    pub linkdata: linktext4, // NF4LNK
-    pub devdata: specdata4,  // NF4BLK / NF4CHR
+struct createtype4 {
+    ftype: ftype4,
+    linkdata: linktext4, // NF4LNK
+    devdata: specdata4,  // NF4BLK / NF4CHR
 }
 impl XDR for createtype4 {
     fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
@@ -1871,55 +1876,55 @@ impl XDR for createtype4 {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct CREATE4args {
-    pub objtype: createtype4,
-    pub objname: component4,
-    pub createattrs: fattr4,
+struct CREATE4args {
+    objtype: createtype4,
+    objname: component4,
+    createattrs: fattr4,
 }
 xdr_struct!(CREATE4args, objtype, objname, createattrs);
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct CREATE4resok {
-    pub cinfo: change_info4,
-    pub attrset: bitmap4,
+struct CREATE4resok {
+    cinfo: change_info4,
+    attrset: bitmap4,
 }
 xdr_struct!(CREATE4resok, cinfo, attrset);
 
 // ---- RENAME (RFC 8881 §18.26) ----
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct RENAME4args {
-    pub oldname: component4,
-    pub newname: component4,
+struct RENAME4args {
+    oldname: component4,
+    newname: component4,
 }
 xdr_struct!(RENAME4args, oldname, newname);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RENAME4resok {
-    pub source_cinfo: change_info4,
-    pub target_cinfo: change_info4,
+struct RENAME4resok {
+    source_cinfo: change_info4,
+    target_cinfo: change_info4,
 }
 xdr_struct!(RENAME4resok, source_cinfo, target_cinfo);
 
 // ---- RECLAIM_COMPLETE (RFC 8881 §18.51) ----
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct RECLAIM_COMPLETE4args {
-    pub rca_one_fs: bool,
+struct RECLAIM_COMPLETE4args {
+    rca_one_fs: bool,
 }
 xdr_struct!(RECLAIM_COMPLETE4args, rca_one_fs);
 
 // ---- SECINFO / SECINFO_NO_NAME (RFC 8881 §18.29, §18.45) ----
 
 // RPC auth flavors
-pub const AUTH_NONE: u32 = 0;
-pub const AUTH_SYS: u32 = 1;
-pub const RPCSEC_GSS: u32 = 6;
+const AUTH_NONE: u32 = 0;
+const AUTH_SYS: u32 = 1;
+const RPCSEC_GSS: u32 = 6;
 
-pub type sec_oid4 = Vec<u8>; // opaque<>
+type sec_oid4 = Vec<u8>; // opaque<>
 
 /// rpc_gss_svc_t (RFC 2203 / RFC 8881 §18.29).
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
-pub enum rpc_gss_svc_t {
+enum rpc_gss_svc_t {
     #[default]
     RPC_GSS_SVC_NONE = 1,
     RPC_GSS_SVC_INTEGRITY = 2,
@@ -1929,16 +1934,16 @@ xdr_enum_serde!(rpc_gss_svc_t);
 
 /// rpcsec_gss_info (RFC 8881 §18.29).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct rpcsec_gss_info {
-    pub oid: sec_oid4,
-    pub qop: qop4,
-    pub service: rpc_gss_svc_t,
+struct rpcsec_gss_info {
+    oid: sec_oid4,
+    qop: qop4,
+    service: rpc_gss_svc_t,
 }
 xdr_struct!(rpcsec_gss_info, oid, qop, service);
 
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
 #[repr(u32)]
-pub enum secinfo_style4 {
+enum secinfo_style4 {
     #[default]
     SECINFO_STYLE4_CURRENT_FH = 0,
     SECINFO_STYLE4_PARENT = 1,
@@ -1948,10 +1953,10 @@ xdr_enum_serde!(secinfo_style4);
 /// secinfo4 union switched on flavor (RFC 8881 §18.29).
 /// AUTH_NONE / AUTH_SYS carry no body; RPCSEC_GSS carries rpcsec_gss_info.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct secinfo4 {
-    pub flavor: u32,
+struct secinfo4 {
+    flavor: u32,
     /// Present iff flavor == RPCSEC_GSS.
-    pub gss_info: Option<rpcsec_gss_info>,
+    gss_info: Option<rpcsec_gss_info>,
 }
 impl XDR for secinfo4 {
     fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
@@ -1998,55 +2003,55 @@ impl XDR for Vec<secinfo4> {
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SECINFO_NO_NAME4args {
-    pub style: secinfo_style4,
+struct SECINFO_NO_NAME4args {
+    style: secinfo_style4,
 }
 xdr_struct!(SECINFO_NO_NAME4args, style);
 
 // ---- SECINFO (RFC 8881 §18.29 / RFC 7530 §16.31) ----
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct SECINFO4args {
-    pub name: component4,
+struct SECINFO4args {
+    name: component4,
 }
 xdr_struct!(SECINFO4args, name);
 
 /// SECINFO4resok = secinfo4<>  (shared by SECINFO and SECINFO_NO_NAME).
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct SECINFO4resok {
-    pub flavors: Vec<secinfo4>,
+struct SECINFO4resok {
+    flavors: Vec<secinfo4>,
 }
 xdr_struct!(SECINFO4resok, flavors);
 
 // ---- READLINK (RFC 8881 §18.24) ----
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct READLINK4resok {
-    pub link: linktext4,
+struct READLINK4resok {
+    link: linktext4,
 }
 xdr_struct!(READLINK4resok, link);
 
 // ---- COMMIT (RFC 8881 §18.3) ----
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct COMMIT4args {
-    pub offset: offset4,
-    pub count: count4,
+struct COMMIT4args {
+    offset: offset4,
+    count: count4,
 }
 xdr_struct!(COMMIT4args, offset, count);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct COMMIT4resok {
-    pub writeverf: verifier4,
+struct COMMIT4resok {
+    writeverf: verifier4,
 }
 xdr_struct!(COMMIT4resok, writeverf);
 
 // ---- TEST_STATEID (RFC 8881 §18.48) ----
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TEST_STATEID4args {
-    pub ts_stateids: Vec<stateid4>,
+struct TEST_STATEID4args {
+    ts_stateids: Vec<stateid4>,
 }
 xdr_struct!(TEST_STATEID4args, ts_stateids);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct TEST_STATEID4resok {
-    pub tsr_status_codes: Vec<nfsstat4>,
+struct TEST_STATEID4resok {
+    tsr_status_codes: Vec<nfsstat4>,
 }
 xdr_struct!(TEST_STATEID4resok, tsr_status_codes);

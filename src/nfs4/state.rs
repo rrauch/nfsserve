@@ -147,13 +147,13 @@ struct SlotState {
 }
 
 // ---- EXCHANGE_ID outcome ----
-pub struct ExchangeIdResult {
+pub(super) struct ExchangeIdResult {
     pub clientid: clientid4,
     pub seqid: sequenceid4,
 }
 
 // ---- CREATE_SESSION outcome ----
-pub enum CreateSessionOutcome {
+pub(super) enum CreateSessionOutcome {
     Ok {
         sessionid: sessionid4,
     },
@@ -166,7 +166,7 @@ pub enum CreateSessionOutcome {
 }
 
 // ---- SEQUENCE outcome ----
-pub enum SequenceOutcome {
+pub(super) enum SequenceOutcome {
     New,
     Replay(Vec<u8>),
     RetryUncached,
@@ -176,7 +176,7 @@ pub enum SequenceOutcome {
 }
 
 impl NFS4State {
-    pub fn new(lease: Duration) -> Self {
+    pub(crate) fn new(lease: Duration) -> Self {
         let inner = Arc::new(Mutex::new(Inner {
             lease,
             boot_verifier: getrandom::u32().expect("OS RNG failure"),
@@ -207,7 +207,7 @@ impl NFS4State {
     /// If the same ownerid returns with a new verifier, the client rebooted;
     /// we replace the record (and orphan its old sessions — a real impl would
     /// expire them; single-slot skeleton drops references lazily).
-    pub fn exchange_id(&self, co_ownerid: &[u8], co_verifier: &verifier4) -> ExchangeIdResult {
+    pub(super) fn exchange_id(&self, co_ownerid: &[u8], co_verifier: &verifier4) -> ExchangeIdResult {
         let mut g = self.inner.lock().unwrap();
 
         if let Some(rec) = g.clients.get(co_ownerid) {
@@ -251,7 +251,7 @@ impl NFS4State {
 
     /// CREATE_SESSION: validate clientid + seqid, allocate a session.
     /// `num_slots` = negotiated ca_maxrequests (>=1).
-    pub fn create_session(
+    pub(super) fn create_session(
         &self,
         clientid: clientid4,
         csa_sequence: sequenceid4,
@@ -306,7 +306,12 @@ impl NFS4State {
 
     /// SEQUENCE slot check. Advances slot on New.
     /// Renews lease if valid.
-    pub fn sequence_check(&self, sessionid: &sessionid4, slotid: slotid4, seqid: sequenceid4) -> SequenceOutcome {
+    pub(super) fn sequence_check(
+        &self,
+        sessionid: &sessionid4,
+        slotid: slotid4,
+        seqid: sequenceid4,
+    ) -> SequenceOutcome {
         let mut g = self.inner.lock().unwrap();
 
         // Resolve owning client.
@@ -359,7 +364,7 @@ impl NFS4State {
     }
 
     /// Store the full COMPOUND4res reply for a slot (sa_cachethis case).
-    pub fn cache_reply(&self, sessionid: &sessionid4, slotid: slotid4, seqid: sequenceid4, reply: Vec<u8>) {
+    pub(super) fn cache_reply(&self, sessionid: &sessionid4, slotid: slotid4, seqid: sequenceid4, reply: Vec<u8>) {
         let mut g = self.inner.lock().unwrap();
         if let Some(sess) = g.sessions.get_mut(sessionid) {
             if let Some(slot) = sess.slots.get_mut(slotid as usize) {
@@ -371,7 +376,7 @@ impl NFS4State {
     }
 
     /// DESTROY_SESSION: remove session + unlink from client.
-    pub fn destroy_session(&self, sessionid: &sessionid4) -> bool {
+    pub(super) fn destroy_session(&self, sessionid: &sessionid4) -> bool {
         let mut g = self.inner.lock().unwrap();
         match g.sessions.remove(sessionid) {
             Some(sess) => {
@@ -387,7 +392,7 @@ impl NFS4State {
     }
 
     /// DESTROY_CLIENTID: reject if sessions still exist (CLIENTID_BUSY).
-    pub fn destroy_clientid(&self, clientid: clientid4) -> DestroyClientIdOutcome {
+    pub(super) fn destroy_clientid(&self, clientid: clientid4) -> DestroyClientIdOutcome {
         let mut g = self.inner.lock().unwrap();
         let owner = match g.clientid_index.get(&clientid).cloned() {
             Some(o) => o,
@@ -403,7 +408,7 @@ impl NFS4State {
 
     /// Mark the client owning `sessionid` as having completed reclaim.
     /// Idempotent; no-op if the session/client is gone.
-    pub fn set_reclaim_complete(&self, sessionid: &sessionid4) {
+    pub(super) fn set_reclaim_complete(&self, sessionid: &sessionid4) {
         let mut g = self.inner.lock().unwrap();
         let clientid = match g.sessions.get(sessionid) {
             Some(s) => s.clientid,
@@ -416,7 +421,7 @@ impl NFS4State {
         }
     }
 
-    pub fn open(
+    pub(super) fn open(
         &self,
         clientid: clientid4,
         owner: &[u8],
@@ -468,7 +473,7 @@ impl NFS4State {
 
     /// Validate a stateid for READ/WRITE. Returns the fileid on success.
     /// Accepts special stateids (all-zero / all-one) as anonymous access.
-    pub fn resolve_stateid(&self, sid: &stateid4) -> ResolveStateid {
+    pub(super) fn resolve_stateid(&self, sid: &stateid4) -> ResolveStateid {
         // Special stateids: seqid 0 or 0xffffffff with all-zero/all-one other.
         let all_zero = sid.other == [0u8; NFS4_OTHER_SIZE];
         let all_one = sid.other == [0xffu8; NFS4_OTHER_SIZE];
@@ -490,7 +495,7 @@ impl NFS4State {
     /// reference. The open state is only removed once the last reference closes.
     /// The returned stateid must carry the bumped seqid with the same `other`
     /// (the "close stateid").
-    pub fn close(&self, sid: &stateid4) -> CloseOutcome {
+    pub(super) fn close(&self, sid: &stateid4) -> CloseOutcome {
         let mut g = self.inner.lock().unwrap();
         match g.opens.get_mut(&sid.other) {
             Some(o) => {
@@ -520,7 +525,7 @@ impl NFS4State {
     }
 
     /// Returns true if `sid.other` names a live open stateid.
-    pub fn stateid_is_valid(&self, sid: &stateid4) -> bool {
+    pub(super) fn stateid_is_valid(&self, sid: &stateid4) -> bool {
         let all_zero = sid.other == [0u8; NFS4_OTHER_SIZE];
         let all_one = sid.other == [0xffu8; NFS4_OTHER_SIZE];
         if all_zero || all_one {
@@ -531,42 +536,42 @@ impl NFS4State {
     }
 }
 
-pub enum DestroyClientIdOutcome {
+pub(super) enum DestroyClientIdOutcome {
     Ok,
     StaleClientId,
     Busy,
 }
 
-pub enum OpenOutcome {
+pub(super) enum OpenOutcome {
     Ok { stateid: stateid4 },
     StaleClientId,
 }
 
-pub enum ResolveStateid {
+pub(super) enum ResolveStateid {
     Open { fileid: u64, share_access: u32 },
     Special,
     Bad,
 }
 
-pub enum CloseOutcome {
+pub(super) enum CloseOutcome {
     Ok { stateid: stateid4 },
     Bad,
 }
 
 // ---- SETCLIENTID outcomes (NFSv4.0) ----
-pub struct SetClientIdResult {
+pub(super) struct SetClientIdResult {
     pub clientid: clientid4,
     pub confirm_verifier: verifier4,
 }
 
-pub enum SetClientIdConfirmOutcome {
+pub(super) enum SetClientIdConfirmOutcome {
     Ok,
     StaleClientId,
     /// clientid/verifier mismatch.
     Mismatch,
 }
 
-pub enum RenewOutcome {
+pub(super) enum RenewOutcome {
     Ok,
     StaleClientId,
     Expired,
@@ -576,7 +581,7 @@ impl NFS4State {
     /// SETCLIENTID (NFSv4.0). Creates an unconfirmed client record keyed by
     /// the opaque client id, generating a fresh clientid and a confirm
     /// verifier. A repeat with the same (id, verifier) reuses the record.
-    pub fn setclientid(&self, id: &[u8], co_verifier: &verifier4) -> SetClientIdResult {
+    pub(super) fn setclientid(&self, id: &[u8], co_verifier: &verifier4) -> SetClientIdResult {
         let mut g = self.inner.lock().unwrap();
 
         // If an existing record for this id has a different boot verifier,
@@ -616,7 +621,7 @@ impl NFS4State {
 
     /// SETCLIENTID_CONFIRM (NFSv4.0). Confirms the record whose clientid and
     /// confirm verifier match.
-    pub fn setclientid_confirm(&self, clientid: clientid4, confirm: &verifier4) -> SetClientIdConfirmOutcome {
+    pub(super) fn setclientid_confirm(&self, clientid: clientid4, confirm: &verifier4) -> SetClientIdConfirmOutcome {
         let mut g = self.inner.lock().unwrap();
         let ownerid = match g.clientid_index.get(&clientid).cloned() {
             Some(o) => o,
@@ -637,7 +642,7 @@ impl NFS4State {
     }
 
     /// RENEW (NFSv4.0). Renews the client lease.
-    pub fn renew(&self, clientid: clientid4) -> RenewOutcome {
+    pub(super) fn renew(&self, clientid: clientid4) -> RenewOutcome {
         let mut g = self.inner.lock().unwrap();
         let ownerid = match g.clientid_index.get(&clientid).cloned() {
             Some(o) => o,
@@ -658,7 +663,7 @@ impl NFS4State {
 
     /// OPEN_CONFIRM (NFSv4.0). Marks the open owner confirmed and bumps the
     /// stateid seqid. Returns the confirmed stateid, or Bad on unknown stateid.
-    pub fn open_confirm(&self, sid: &stateid4) -> CloseOutcome {
+    pub(super) fn open_confirm(&self, sid: &stateid4) -> CloseOutcome {
         let mut g = self.inner.lock().unwrap();
         let (clientid, owner) = match g.opens.get(&sid.other) {
             Some(o) => (o.clientid, o.owner.clone()),
@@ -679,7 +684,7 @@ impl NFS4State {
 
     /// Whether the open owner has been confirmed (NFSv4.0). New owners are
     /// unconfirmed and require OPEN_CONFIRM after their first OPEN.
-    pub fn open_owner_confirmed(&self, clientid: clientid4, owner: &[u8]) -> bool {
+    pub(super) fn open_owner_confirmed(&self, clientid: clientid4, owner: &[u8]) -> bool {
         let g = self.inner.lock().unwrap();
         g.open_owners
             .get(&(clientid, owner.to_vec()))
