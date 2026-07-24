@@ -174,47 +174,8 @@ pub enum nfsstat4 {
 }
 xdr_enum_serde!(nfsstat4);
 
-impl XDR for Vec<stateid4> {
-    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
-        (self.len() as u32).serialize(dest)?;
-        for e in self {
-            e.serialize(dest)?;
-        }
-        Ok(())
-    }
-    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
-        let mut n = 0u32;
-        n.deserialize(src)?;
-        self.clear();
-        for _ in 0..n {
-            let mut e = stateid4::default();
-            e.deserialize(src)?;
-            self.push(e);
-        }
-        Ok(())
-    }
-}
-
-impl XDR for Vec<nfsstat4> {
-    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
-        (self.len() as u32).serialize(dest)?;
-        for e in self {
-            e.serialize(dest)?;
-        }
-        Ok(())
-    }
-    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
-        let mut n = 0u32;
-        n.deserialize(src)?;
-        self.clear();
-        for _ in 0..n {
-            let mut e = nfsstat4::default();
-            e.deserialize(src)?;
-            self.push(e);
-        }
-        Ok(())
-    }
-}
+xdr_vec!(stateid4);
+xdr_vec!(nfsstat4);
 
 impl From<nfsstat3> for nfsstat4 {
     fn from(e: nfsstat3) -> Self {
@@ -953,28 +914,7 @@ pub struct nfsace4 {
     pub who: nfsstring,
 }
 xdr_struct!(nfsace4, acetype, aceflag, acemask, who);
-
-impl XDR for Vec<nfsace4> {
-    fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()> {
-        assert!(self.len() < u32::MAX as usize);
-        (self.len() as u32).serialize(dest)?;
-        for i in self {
-            i.serialize(dest)?;
-        }
-        Ok(())
-    }
-    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
-        let mut length: u32 = 0;
-        length.deserialize(src)?;
-        self.clear();
-        for _ in 0..length {
-            let mut e = nfsace4::default();
-            e.deserialize(src)?;
-            self.push(e);
-        }
-        Ok(())
-    }
-}
+xdr_vec!(nfsace4);
 
 pub type specdata4 = specdata;
 
@@ -1371,27 +1311,7 @@ impl XDR for callback_sec_parms4 {
     }
 }
 
-impl XDR for Vec<callback_sec_parms4> {
-    fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()> {
-        (self.len() as u32).serialize(dest)?;
-        for e in self {
-            e.serialize(dest)?;
-        }
-        Ok(())
-    }
-
-    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
-        let mut n = 0u32;
-        n.deserialize(src)?;
-        self.clear();
-        for _ in 0..n {
-            let mut e = callback_sec_parms4::default();
-            e.deserialize(src)?;
-            self.push(e);
-        }
-        Ok(())
-    }
-}
+xdr_vec!(callback_sec_parms4);
 
 #[derive(Clone, Debug, Default, PartialEq)]
 struct cbsp_authsys {
@@ -1981,26 +1901,7 @@ impl XDR for secinfo4 {
     }
 }
 
-impl XDR for Vec<secinfo4> {
-    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
-        (self.len() as u32).serialize(dest)?;
-        for e in self {
-            e.serialize(dest)?;
-        }
-        Ok(())
-    }
-    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
-        let mut n = 0u32;
-        n.deserialize(src)?;
-        self.clear();
-        for _ in 0..n {
-            let mut e = secinfo4::default();
-            e.deserialize(src)?;
-            self.push(e);
-        }
-        Ok(())
-    }
-}
+xdr_vec!(secinfo4);
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct SECINFO_NO_NAME4args {

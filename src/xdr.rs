@@ -139,26 +139,7 @@ impl XDR for nfsstring {
     }
 }
 
-impl XDR for Vec<u32> {
-    fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()> {
-        assert!(self.len() < u32::MAX as usize);
-        let length = self.len() as u32;
-        length.serialize(dest)?;
-        for i in self {
-            i.serialize(dest)?;
-        }
-        Ok(())
-    }
-    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
-        let mut length: u32 = 0;
-        length.deserialize(src)?;
-        self.resize(length as usize, 0);
-        for i in self {
-            i.deserialize(src)?;
-        }
-        Ok(())
-    }
-}
+xdr_vec!(u32);
 
 #[allow(non_camel_case_types)]
 #[macro_export]
@@ -229,6 +210,37 @@ macro_rules! xdr_bool_union {
     };
 }
 
+#[allow(non_camel_case_types)]
+#[macro_export]
+macro_rules! xdr_vec {
+    ($t:ty) => {
+        impl XDR for Vec<$t> {
+            fn serialize<R: Write>(&self, dest: &mut R) -> std::io::Result<()> {
+                assert!(self.len() < u32::MAX as usize);
+                let length = self.len() as u32;
+                length.serialize(dest)?;
+                for i in self {
+                    i.serialize(dest)?;
+                }
+                Ok(())
+            }
+            fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+                let mut length: u32 = 0;
+                length.deserialize(src)?;
+                self.clear();
+                self.reserve_exact(length as usize);
+                for _ in 0..length {
+                    let mut v = <$t>::default();
+                    v.deserialize(src)?;
+                    self.push(v);
+                }
+                Ok(())
+            }
+        }
+    };
+}
+
 pub(crate) use xdr_bool_union;
 pub(crate) use xdr_enum_serde;
 pub(crate) use xdr_struct;
+pub(crate) use xdr_vec;
