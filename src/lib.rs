@@ -10,8 +10,8 @@ pub mod xdr;
 pub mod fs_util;
 
 pub mod nfs;
-pub mod nfs3;
-pub mod nfs4;
+pub(crate) mod nfs3;
+pub(crate) mod nfs4;
 pub mod tcp;
 mod transaction_tracker;
 pub mod vfs;

@@ -11,7 +11,7 @@ use async_trait::async_trait;
 use intaglio::osstr::SymbolTable;
 use intaglio::Symbol;
 use nfsserve::fs_util::*;
-use nfsserve::nfs3::*;
+use nfsserve::nfs::*;
 use nfsserve::tcp::{NFSTcp, NFSTcpListener};
 use nfsserve::vfs::{vfs_fh, DirEntry, NFSFileSystem, ReadDirResult, VFSCapabilities};
 use tokio::fs::{File, OpenOptions};

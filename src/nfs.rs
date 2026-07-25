@@ -1,9 +1,16 @@
 use crate::xdr::*;
 use crate::xdr_struct;
 
-use crate::nfs3::{fileid3, nfs_fh3, nfsstat3};
 use std::fmt;
 use std::io::{Read, Write};
+
+pub use crate::nfs3::{
+    cookie3, cookieverf3, count3, createverf3, diropargs3, fattr3, fileid3, filename3, fsinfo3, ftype3, gid3, mode3,
+    nfs_fh3, nfspath3, nfsstat3, nfstime3, offset3, post_op_attr, post_op_fh3, pre_op_attr, sattr3, set_atime,
+    set_gid3, set_mode3, set_mtime, set_size3, set_uid3, size3, specdata3, symlinkdata3, uid3, wcc_attr, wcc_data,
+    writeverf3, FSF_CANSETTIME, FSF_HOMOGENEOUS, FSF_LINK, FSF_SYMLINK, NFS3_COOKIEVERFSIZE, NFS3_CREATEVERFSIZE,
+    NFS3_FHSIZE, NFS3_WRITEVERFSIZE, VERSION,
+};
 
 pub const PROGRAM: u32 = 100003;
 
