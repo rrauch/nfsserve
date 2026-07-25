@@ -7,8 +7,8 @@ use tracing::{debug, warn};
 
 use crate::context::RPCContext;
 use crate::nfs;
-use crate::nfs::{id_to_fh, nfsstring};
-use crate::nfs4::state::ManagedFileHandle;
+use crate::nfs::{id_to_fh, nfsstring, write_verifier};
+use crate::nfs4::state::{ManagedFileHandle, OwnerSeqid};
 use crate::nfs4::*;
 use crate::rpc::*;
 use crate::vfs::OpenMode;
@@ -113,7 +113,7 @@ macro_rules! ensure_ftype {
 // ---------------------------------------------------------------------------
 
 fn fh_to_id(context: &RPCContext, fh: &nfs_fh4) -> Result<fileid4, OpError> {
-    Ok(nfs::fh_to_id(&context.nfs4_state, fh)?)
+    Ok(nfs::fh_to_id(context.epoch, fh)?)
 }
 
 async fn getattr4(context: &RPCContext, id: fileid4) -> Result<fattr4, OpError> {
@@ -185,10 +185,10 @@ fn check_stateid(
     fileid: fileid4,
     need: Need,
 ) -> Result<Option<ManagedFileHandle>, OpError> {
-    use super::state::ResolveStateid;
-    match context.nfs4_state.resolve_stateid(stateid) {
-        ResolveStateid::Special => Ok(None),
-        ResolveStateid::Open {
+    use super::state::Resolved;
+    match context.nfs4_state.resolve(stateid)? {
+        Resolved::Anonymous | Resolved::Bypass => Ok(None),
+        Resolved::Open {
             fileid: sid_fileid,
             fh: vfs_fh,
             mode,
@@ -203,7 +203,6 @@ fn check_stateid(
             }
             Ok(Some(vfs_fh))
         },
-        ResolveStateid::Bad => Err(nfsstat4::NFS4ERR_BAD_STATEID.into()),
     }
 }
 
@@ -400,7 +399,14 @@ async fn dispatch_op(
         OP_CREATE_SESSION => run!(op_create_session(input, op_out, context)),
         OP_DESTROY_SESSION => run!(op_destroy_session(input, op_out, state, context)),
         OP_DESTROY_CLIENTID => run!(op_destroy_clientid(input, op_out, context)),
-        OP_SEQUENCE => op_sequence(input, op_out, state, context).await?,
+        OP_SEQUENCE => match op_sequence(input, op_out, state, context).await {
+            Ok(res) => res,
+            Err(OpError::Status(s)) => {
+                s.serialize(op_out)?;
+                DispatchResult::Status(s)
+            },
+            Err(OpError::Fatal(e)) => return Err(e),
+        },
         OP_RECLAIM_COMPLETE => run!(op_reclaim_complete(input, op_out, state, context)),
         OP_SECINFO_NO_NAME => run!(op_secinfo_no_name(input, op_out, state, context)),
 
@@ -458,13 +464,13 @@ async fn op_exchange_id(input: &mut impl Read, op_out: &mut impl Write, context:
         return Err(nfsstat4::NFS4ERR_NOTSUPP.into());
     }
 
-    let res = context
+    let (clientid, seqid) = context
         .nfs4_state
         .exchange_id(&args.eia_clientowner.co_ownerid, &args.eia_clientowner.co_verifier);
 
     let resok = EXCHANGE_ID4resok {
-        eir_clientid: res.clientid,
-        eir_sequenceid: res.seqid,
+        eir_clientid: clientid,
+        eir_sequenceid: seqid,
         eir_flags: EXCHGID4_FLAG_USE_NON_PNFS,
         eir_state_protect: state_protect4_r {
             spr_how: state_protect_how4::SP4_NONE,
@@ -529,17 +535,14 @@ async fn op_create_session(
 
     let num_slots = fore.ca_maxrequests;
 
-    use super::state::CreateSessionOutcome::*;
+    use super::state::CreateSession::*;
     let sessionid = match context.nfs4_state.create_session(
         args.csa_clientid,
         args.csa_sequence,
         num_slots,
-        fore.clone(),
-        back.clone(),
-    ) {
-        Ok { sessionid } | Replay { sessionid } => sessionid,
-        StaleClientId => return Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
-        SeqMisordered => return Err(nfsstat4::NFS4ERR_SEQ_MISORDERED.into()),
+        fore.ca_maxresponsesize_cached,
+    )? {
+        New(sessionid) | Replay(sessionid) => sessionid,
     };
 
     let resok = CREATE_SESSION4resok {
@@ -576,12 +579,9 @@ async fn op_destroy_session(
         state.session = None;
     }
 
-    if context.nfs4_state.destroy_session(&args.dsa_sessionid) {
-        nfsstat4::NFS4_OK.serialize(op_out)?;
-        Ok(())
-    } else {
-        Err(nfsstat4::NFS4ERR_BADSESSION.into())
-    }
+    context.nfs4_state.destroy_session(&args.dsa_sessionid)?;
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
 }
 
 /// OP_DESTROY_CLIENTID (RFC 8881 §18.50).
@@ -595,15 +595,9 @@ async fn op_destroy_clientid(
 
     debug!("OP_DESTROY_CLIENTID clientid={:#x}", args.dca_clientid);
 
-    use super::state::DestroyClientIdOutcome;
-    match context.nfs4_state.destroy_clientid(args.dca_clientid) {
-        DestroyClientIdOutcome::Ok => {
-            nfsstat4::NFS4_OK.serialize(op_out)?;
-            Ok(())
-        },
-        DestroyClientIdOutcome::StaleClientId => Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
-        DestroyClientIdOutcome::Busy => Err(nfsstat4::NFS4ERR_CLIENTID_BUSY.into()),
-    }
+    context.nfs4_state.destroy_clientid(args.dca_clientid)?;
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
 }
 
 /// SEQUENCE keeps its native signature: it can return Replay and must
@@ -613,7 +607,7 @@ async fn op_sequence(
     op_out: &mut impl Write,
     state: &mut CompoundState,
     context: &RPCContext,
-) -> Result<DispatchResult, anyhow::Error> {
+) -> Result<DispatchResult, OpError> {
     let mut args = SEQUENCE4args::default();
     args.deserialize(input)?;
 
@@ -627,17 +621,14 @@ async fn op_sequence(
         return Ok(DispatchResult::Status(nfsstat4::NFS4ERR_SEQUENCE_POS));
     }
 
-    use super::state::SequenceOutcome::*;
+    use super::state::Sequence::*;
     let status = match context
         .nfs4_state
-        .sequence_check(&args.sa_sessionid, args.sa_slotid, args.sa_sequenceid)
+        .sequence(&args.sa_sessionid, args.sa_slotid, args.sa_sequenceid)?
     {
         New => nfsstat4::NFS4_OK,
         Replay(cached) => return Ok(DispatchResult::Replay(cached)),
         RetryUncached => nfsstat4::NFS4ERR_RETRY_UNCACHED_REP,
-        Misordered => nfsstat4::NFS4ERR_SEQ_MISORDERED,
-        BadSession => nfsstat4::NFS4ERR_BADSESSION,
-        BadSlot => nfsstat4::NFS4ERR_BADSLOT,
     };
 
     if status != nfsstat4::NFS4_OK {
@@ -685,7 +676,7 @@ async fn op_reclaim_complete(
     debug!("OP_RECLAIM_COMPLETE one_fs={}", args.rca_one_fs);
 
     if let Some(session) = &state.session {
-        context.nfs4_state.set_reclaim_complete(&session.sessionid);
+        context.nfs4_state.reclaim_complete(&session.sessionid)?;
     }
 
     nfsstat4::NFS4_OK.serialize(op_out)?;
@@ -782,7 +773,7 @@ async fn op_putrootfh(op_out: &mut impl Write, state: &mut CompoundState, contex
     state.require_session()?;
 
     let root = context.vfs.root_dir();
-    let fh = id_to_fh(&context.nfs4_state, root);
+    let fh = id_to_fh(context.epoch, root);
 
     debug!("OP_PUTROOTFH root_id={} fh={:x?}", root, fh.data);
 
@@ -918,7 +909,7 @@ async fn op_lookup(
     debug!("OP_LOOKUP dir={} name={:?}", dirid, args.objname);
 
     let objid = context.vfs.lookup(dirid, &name).await?;
-    state.current_fh = Some(id_to_fh(&context.nfs4_state, objid));
+    state.current_fh = Some(id_to_fh(context.epoch, objid));
 
     nfsstat4::NFS4_OK.serialize(op_out)?;
     Ok(())
@@ -971,7 +962,7 @@ async fn op_readdir(
 
     for e in &listing.entries {
         let mut attr = fattr4::from_v3(&e.attr, &fsinfo);
-        attr.filehandle = Some(id_to_fh(&context.nfs4_state, e.fileid));
+        attr.filehandle = Some(id_to_fh(context.epoch, e.fileid));
         attr.retain_requested(&args.attr_request);
 
         let mut ent = Vec::new();
@@ -1096,28 +1087,27 @@ async fn op_open(
         OpenMode::ReadOnly
     };
 
-    use super::state::OpenOutcome;
-    let stateid = match context
-        .nfs4_state
-        .open(args.owner.clientid, &args.owner.owner, args.seqid, fileid, mode)
-        .await
-    {
-        OpenOutcome::Ok { stateid } => stateid,
-        OpenOutcome::StaleClientId => return Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
-        OpenOutcome::Err(stat) => return Err(stat.into()),
+    let seqid = if state.minorversion == 0 {
+        OwnerSeqid::V40(args.seqid)
+    } else {
+        OwnerSeqid::V41
     };
 
-    state.current_fh = Some(id_to_fh(&context.nfs4_state, fileid));
+    let opened = context
+        .nfs4_state
+        .open(args.owner.clientid, &args.owner.owner, seqid, fileid, mode)
+        .await?;
+
+    state.current_fh = Some(id_to_fh(context.epoch, fileid));
 
     // NFSv4.0: a fresh open owner must be confirmed via OPEN_CONFIRM before
     // its stateids are usable. 4.1 has no OPEN_CONFIRM.
-    let need_confirm =
-        state.minorversion == 0 && !context.nfs4_state.open_owner_confirmed(args.owner.clientid, &args.owner.owner);
+    let need_confirm = state.minorversion == 0 && opened.confirm_required;
 
     let rflags = if need_confirm { OPEN4_RESULT_CONFIRM } else { 0 };
 
     let resok = OPEN4resok {
-        stateid,
+        stateid: opened.stateid,
         cinfo: change_info4 {
             atomic: false,
             before: dir_change_before,
@@ -1152,15 +1142,16 @@ async fn op_close(
         args.seqid, args.open_stateid.seqid, args.open_stateid.other
     );
 
-    use super::state::CloseOutcome;
-    match context.nfs4_state.close(&args.open_stateid) {
-        CloseOutcome::Ok { stateid } => {
-            nfsstat4::NFS4_OK.serialize(op_out)?;
-            stateid.serialize(op_out)?;
-            Ok(())
-        },
-        CloseOutcome::Bad => Err(nfsstat4::NFS4ERR_BAD_STATEID.into()),
-    }
+    let seqid = if state.minorversion == 0 {
+        OwnerSeqid::V40(args.seqid)
+    } else {
+        OwnerSeqid::V41
+    };
+
+    let stateid = context.nfs4_state.close(&args.open_stateid, seqid)?;
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    stateid.serialize(op_out)?;
+    Ok(())
 }
 
 /// OP_READ (RFC 8881 §18.22).
@@ -1226,7 +1217,7 @@ async fn op_write(
     let resok = WRITE4resok {
         count: write_len as count4,
         committed: stable_how4::FILE_SYNC4,
-        writeverf: context.nfs4_state.write_verifier(),
+        writeverf: write_verifier(context.epoch),
     };
 
     nfsstat4::NFS4_OK.serialize(op_out)?;
@@ -1312,7 +1303,7 @@ async fn op_create(
         _ => return Err(nfsstat4::NFS4ERR_NOTSUPP.into()),
     };
 
-    state.current_fh = Some(id_to_fh(&context.nfs4_state, new_id));
+    state.current_fh = Some(id_to_fh(context.epoch, new_id));
     let after = change_after(context, dirid, before).await;
 
     let resok = CREATE4resok {
@@ -1495,7 +1486,7 @@ async fn op_commit(
     debug!("OP_COMMIT id={} offset={} count={}", fileid, args.offset, args.count);
 
     let resok = COMMIT4resok {
-        writeverf: context.nfs4_state.write_verifier(),
+        writeverf: write_verifier(context.epoch),
     };
 
     nfsstat4::NFS4_OK.serialize(op_out)?;
@@ -1521,13 +1512,7 @@ async fn op_test_stateid(
     let codes: Vec<nfsstat4> = args
         .ts_stateids
         .iter()
-        .map(|sid| {
-            if context.nfs4_state.stateid_is_valid(sid) {
-                nfsstat4::NFS4_OK
-            } else {
-                nfsstat4::NFS4ERR_BAD_STATEID
-            }
-        })
+        .map(|sid| context.nfs4_state.test_stateid(sid))
         .collect();
 
     let resok = TEST_STATEID4resok {
@@ -1555,11 +1540,11 @@ async fn op_setclientid(input: &mut impl Read, op_out: &mut impl Write, context:
         args.callback.cb_location.r_addr,
     );
 
-    let res = context.nfs4_state.setclientid(&args.client.id, &args.client.verifier);
+    let (clientid, verifier) = context.nfs4_state.setclientid(&args.client.id, &args.client.verifier);
 
     let resok = SETCLIENTID4resok {
-        clientid: res.clientid,
-        setclientid_confirm: res.confirm_verifier,
+        clientid,
+        setclientid_confirm: verifier,
     };
 
     nfsstat4::NFS4_OK.serialize(op_out)?;
@@ -1578,15 +1563,11 @@ async fn op_setclientid_confirm(
 
     debug!("OP_SETCLIENTID_CONFIRM clientid={:#x}", args.clientid);
 
-    use super::state::SetClientIdConfirmOutcome::*;
-    match context.nfs4_state.setclientid_confirm(args.clientid, &args.setclientid_confirm) {
-        Ok => {
-            nfsstat4::NFS4_OK.serialize(op_out)?;
-            Result::Ok(())
-        },
-        StaleClientId => Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
-        Mismatch => Err(nfsstat4::NFS4ERR_CLID_INUSE.into()),
-    }
+    context
+        .nfs4_state
+        .setclientid_confirm(args.clientid, &args.setclientid_confirm)?;
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
 }
 
 /// OP_RENEW (NFSv4.0, RFC 7530 §16.30).
@@ -1596,15 +1577,9 @@ async fn op_renew(input: &mut impl Read, op_out: &mut impl Write, context: &RPCC
 
     debug!("OP_RENEW clientid={:#x}", args.clientid);
 
-    use super::state::RenewOutcome::*;
-    match context.nfs4_state.renew(args.clientid) {
-        Ok => {
-            nfsstat4::NFS4_OK.serialize(op_out)?;
-            Result::Ok(())
-        },
-        StaleClientId => Err(nfsstat4::NFS4ERR_STALE_CLIENTID.into()),
-        Expired => Err(nfsstat4::NFS4ERR_EXPIRED.into()),
-    }
+    context.nfs4_state.renew(args.clientid)?;
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    Ok(())
 }
 
 /// OP_OPEN_CONFIRM (NFSv4.0, RFC 7530 §16.18).
@@ -1623,16 +1598,11 @@ async fn op_open_confirm(
 
     debug!("OP_OPEN_CONFIRM seqid={} stateid.other={:x?}", args.seqid, args.open_stateid.other);
 
-    use super::state::CloseOutcome;
-    match context.nfs4_state.open_confirm(&args.open_stateid) {
-        CloseOutcome::Ok { stateid } => {
-            let resok = OPEN_CONFIRM4resok { open_stateid: stateid };
-            nfsstat4::NFS4_OK.serialize(op_out)?;
-            resok.serialize(op_out)?;
-            Ok(())
-        },
-        CloseOutcome::Bad => Err(nfsstat4::NFS4ERR_BAD_STATEID.into()),
-    }
+    let stateid = context.nfs4_state.open_confirm(&args.open_stateid, args.seqid)?;
+    let resok = OPEN_CONFIRM4resok { open_stateid: stateid };
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    resok.serialize(op_out)?;
+    Ok(())
 }
 
 /// OP_RELEASE_LOCKOWNER (NFSv4.0, RFC 7530 §16.37).

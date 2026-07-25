@@ -50,7 +50,7 @@ pub enum VFSCapabilities {
 }
 
 /// The mode in which a file is opened
-#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
 pub enum OpenMode {
     ReadOnly,
     ReadWrite,

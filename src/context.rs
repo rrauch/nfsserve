@@ -15,6 +15,7 @@ pub struct RPCContext {
     pub mount_signal: Option<mpsc::Sender<bool>>,
     pub export_name: Arc<String>,
     pub transaction_tracker: Arc<TransactionTracker>,
+    pub epoch: u32,
     pub(crate) nfs4_state: Arc<NFS4State>,
 }
 

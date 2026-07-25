@@ -26,6 +26,7 @@ pub struct NFSTcpListener<T: NFSFileSystem + Send + Sync + 'static> {
     export_name: Arc<String>,
     transaction_tracker: Arc<TransactionTracker>,
     nfs4_state: Arc<NFS4State>,
+    epoch: u32,
 }
 
 pub fn generate_host_ip(hostnum: u16) -> String {
@@ -155,14 +156,20 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcpListener<T> {
             SocketAddr::V4(s) => s.port(),
             SocketAddr::V6(s) => s.port(),
         };
+
+        let epoch = getrandom::u32().expect("OS RNG failure");
+        let nfs4_state =
+            Arc::new(NFS4State::new(Duration::from_secs((NFS4_LEASE_TIME as u64 * 2) + 1), arcfs.clone(), epoch));
+
         Ok(NFSTcpListener {
             listener,
             port,
-            arcfs: arcfs.clone(),
+            arcfs,
             mount_signal: None,
             export_name: Arc::from("/".to_string()),
             transaction_tracker: Arc::new(TransactionTracker::new(Duration::from_secs(60))),
-            nfs4_state: Arc::new(NFS4State::new(Duration::from_secs((NFS4_LEASE_TIME as u64 * 2) + 1), arcfs)),
+            epoch,
+            nfs4_state,
         })
     }
 
@@ -208,6 +215,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 mount_signal: self.mount_signal.clone(),
                 export_name: self.export_name.clone(),
                 transaction_tracker: self.transaction_tracker.clone(),
+                epoch: self.epoch,
                 nfs4_state: self.nfs4_state.clone(),
             };
             info!("Accepting connection from {}", context.client_addr);

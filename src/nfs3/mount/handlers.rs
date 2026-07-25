@@ -101,7 +101,7 @@ pub async fn mountproc3_mnt(
     };
     if let Ok(fileid) = context.vfs.path_to_id(&path).await {
         let response = mountres3_ok {
-            fhandle: id_to_fh(&context.nfs4_state, fileid).data,
+            fhandle: id_to_fh(context.epoch, fileid).data,
             auth_flavors: vec![
                 auth_flavor::AUTH_NULL.to_u32().unwrap(),
                 auth_flavor::AUTH_UNIX.to_u32().unwrap(),
