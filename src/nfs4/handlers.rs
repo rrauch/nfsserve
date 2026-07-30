@@ -1,6 +1,7 @@
 #![allow(non_camel_case_types)]
 #![allow(dead_code)]
 
+use anyhow::anyhow;
 use num_traits::cast::FromPrimitive;
 use std::io::{Cursor, Read, Write};
 use tracing::{debug, warn};
@@ -325,9 +326,10 @@ async fn nfsproc4_compound(
 
     if let Some(seq) = &state.session {
         if seq.cache_this {
+            let cid = context.client_id().ok_or_else(|| anyhow!("client_id missing"))?;
             context
                 .nfs4_state
-                .cache_reply(&seq.sessionid, seq.slotid, seq.sequenceid, body.clone());
+                .cache_reply(cid, &seq.sessionid, seq.slotid, seq.sequenceid, body.clone());
         }
     }
 
@@ -581,8 +583,8 @@ async fn op_destroy_session(
     if destroying_current {
         state.session = None;
     }
-
-    context.nfs4_state.destroy_session(&args.dsa_sessionid)?;
+    let cid = context.client_id().ok_or_else(|| nfsstat4::NFS4ERR_BAD_STATEID)?;
+    context.nfs4_state.destroy_session(cid, &args.dsa_sessionid)?;
     nfsstat4::NFS4_OK.serialize(op_out)?;
     Ok(())
 }
@@ -625,10 +627,12 @@ async fn op_sequence(
         return Ok(DispatchResult::Status(nfsstat4::NFS4ERR_SEQUENCE_POS));
     }
 
+    let cid = context.client_id().ok_or_else(|| nfsstat4::NFS4ERR_BAD_STATEID)?;
+
     use super::state::Sequence::*;
     let status = match context
         .nfs4_state
-        .sequence(&args.sa_sessionid, args.sa_slotid, args.sa_sequenceid)?
+        .sequence(cid, &args.sa_sessionid, args.sa_slotid, args.sa_sequenceid)?
     {
         New => nfsstat4::NFS4_OK,
         Replay(cached) => return Ok(DispatchResult::Replay(cached)),
@@ -680,7 +684,8 @@ async fn op_reclaim_complete(
     debug!("OP_RECLAIM_COMPLETE one_fs={}", args.rca_one_fs);
 
     if let Some(session) = &state.session {
-        context.nfs4_state.reclaim_complete(&session.sessionid)?;
+        let cid = context.client_id().ok_or_else(|| nfsstat4::NFS4ERR_BAD_STATEID)?;
+        context.nfs4_state.reclaim_complete(cid, &session.sessionid)?;
     }
 
     nfsstat4::NFS4_OK.serialize(op_out)?;

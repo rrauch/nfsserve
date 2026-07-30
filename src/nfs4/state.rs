@@ -120,9 +120,12 @@ struct Client {
     verifier: verifier4,
     last_renewed: Instant,
     kind: ClientKind,
-    /// 4.0 open-owner bookkeeping. Always empty for 4.1, where SEQUENCE does
-    /// this job; `assert_invariants` enforces that.
-    open_owners: HashMap<Vec<u8>, OpenOwner>,
+    /// This client's open state, keyed by `stateid4.other`. Owned here rather
+    /// than in a server-wide map, so ownership is structural and dropping the
+    /// client drops the state.
+    opens: HashMap<Other, Open>,
+    /// (open_owner, fileid) -> `stateid4.other`. Makes OPEN dedup O(1).
+    open_index: HashMap<(Vec<u8>, fileid4), Other>,
 }
 
 impl Client {
@@ -138,8 +141,22 @@ impl Client {
         }
     }
 
-    fn is_v40(&self) -> bool {
-        matches!(self.kind, ClientKind::V40(_))
+    /// This client's open-owner table, or `None` for 4.1 — which keeps no
+    /// open-owner state at all, since SEQUENCE does that job. `None` is
+    /// therefore also the answer to "is this a 4.1 client", and every caller
+    /// that used to ask `is_v40()` really wanted this.
+    fn open_owners(&self) -> Option<&HashMap<Vec<u8>, OpenOwner>> {
+        match &self.kind {
+            ClientKind::V40(v) => Some(&v.open_owners),
+            ClientKind::V41(_) => None,
+        }
+    }
+
+    fn open_owners_mut(&mut self) -> Option<&mut HashMap<Vec<u8>, OpenOwner>> {
+        match &mut self.kind {
+            ClientKind::V40(v) => Some(&mut v.open_owners),
+            ClientKind::V41(_) => None,
+        }
     }
 }
 
@@ -152,12 +169,29 @@ enum ClientKind {
 struct V40 {
     confirm_verifier: verifier4,
     confirmed: bool,
+    /// Open-owner bookkeeping: sequence ordering, OPEN_CONFIRM, and the
+    /// just-closed stateid a retransmitted CLOSE is routed through. It lives
+    /// here rather than on `Client` so that "4.1 client accumulating
+    /// open-owner state" is unrepresentable instead of merely asserted.
+    open_owners: HashMap<Vec<u8>, OpenOwner>,
+}
+
+impl V40 {
+    /// A record awaiting SETCLIENTID_CONFIRM.
+    fn new(confirm_verifier: verifier4) -> Self {
+        Self {
+            confirm_verifier,
+            confirmed: false,
+            open_owners: HashMap::new(),
+        }
+    }
 }
 
 struct V41 {
     /// Next expected `csa_sequence`.
     create_session_seq: sequenceid4,
-    sessions: Vec<sessionid4>,
+    /// In creation order; the last is the one a CREATE_SESSION replay names.
+    sessions: Vec<Session>,
 }
 
 impl ClientKind {
@@ -191,7 +225,7 @@ struct OpenOwner {
 }
 
 struct Session {
-    clientid: clientid4,
+    id: sessionid4,
     slots: Box<[Slot]>,
     /// Negotiated `ca_maxresponsesize_cached`; bounds the reply cache.
     max_cached: u32,
@@ -209,7 +243,6 @@ struct Slot {
 /// `mode` is the strongest mode ever requested; since `OpenMode` has no
 /// downgrade and OPEN_DOWNGRADE is unsupported, it only ever grows.
 struct Open {
-    clientid: clientid4,
     owner: Vec<u8>,
     fileid: fileid4,
     /// Stateid seqid; bumped by every state-mutating op. Never 0, because 0
@@ -327,12 +360,7 @@ struct Inner {
     /// before a restart are reliably STALE. Also seeds the write verifier.
     epoch: u32,
     clients: HashMap<clientid4, Client>,
-    by_owner: HashMap<(Minor, Vec<u8>), clientid4>,
     unconfirmed: HashMap<(Minor, Vec<u8>), clientid4>,
-    sessions: HashMap<sessionid4, Session>,
-    opens: HashMap<Other, Open>,
-    /// (clientid, open_owner, fileid) -> stateid.other. Makes OPEN dedup O(1).
-    open_index: HashMap<(clientid4, Vec<u8>, fileid4), Other>,
     /// stateid.other -> (clientid, open_owner) for just-closed 4.0 states.
     /// One entry per open-owner; see `retire_open`.
     retired: HashMap<Other, (clientid4, Vec<u8>)>,
@@ -344,11 +372,7 @@ impl Inner {
             lease,
             epoch,
             clients: HashMap::new(),
-            by_owner: HashMap::new(),
             unconfirmed: HashMap::new(),
-            sessions: HashMap::new(),
-            opens: HashMap::new(),
-            open_index: HashMap::new(),
             retired: HashMap::new(),
         }
     }
@@ -365,10 +389,23 @@ impl Inner {
     }
 
     fn fresh_sessionid(&self) -> sessionid4 {
+        let session_ids = self
+            .clients
+            .iter()
+            .filter_map(|(_, c)| {
+                if let ClientKind::V41(v41) = &c.kind {
+                    Some(v41.sessions.iter().map(|s| &s.id))
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect::<Vec<_>>();
+
         loop {
             let mut id = [0u8; 16];
             getrandom::fill(&mut id).expect("OS RNG failure");
-            if !self.sessions.contains_key(&id) {
+            if !session_ids.contains(&&id) {
                 break id;
             }
         }
@@ -377,10 +414,17 @@ impl Inner {
     /// Avoids both live and just-retired states, so a retransmitted CLOSE can
     /// never be misrouted to a fresh open that happened to reuse the bytes.
     fn fresh_other(&self) -> Other {
+        let others = self
+            .clients
+            .iter()
+            .map(|(_, c)| c.opens.iter().map(|(o, _)| o))
+            .flatten()
+            .collect::<Vec<_>>();
+
         loop {
             let mut other = [0u8; NFS4_OTHER_SIZE];
             getrandom::fill(&mut other).expect("OS RNG failure");
-            if !self.opens.contains_key(&other) && !self.retired.contains_key(&other) {
+            if !others.contains(&&other) && !self.retired.contains_key(&other) {
                 break other;
             }
         }
@@ -407,17 +451,40 @@ impl Inner {
         let Some(client) = self.clients.remove(&cid) else {
             return;
         };
-        // Two records may share an owner key, so only retract our own entries.
-        if self.by_owner.get(&client.owner) == Some(&cid) {
-            self.by_owner.remove(&client.owner);
-        }
         if self.unconfirmed.get(&client.owner) == Some(&cid) {
             self.unconfirmed.remove(&client.owner);
         }
-        self.sessions.retain(|_, s| s.clientid != cid);
-        self.opens.retain(|_, o| o.clientid != cid);
-        self.open_index.retain(|(c, _, _), _| *c != cid);
-        self.retired.retain(|_, (c, _)| *c != cid);
+        if let Some(owners) = client.open_owners() {
+            for owner in owners.values() {
+                if let Some(other) = owner.retired {
+                    self.retired.remove(&other);
+                }
+            }
+        }
+    }
+
+    /// The *current* client registered under `owner`, ignoring any pending
+    /// SETCLIENTID attempt.
+    ///
+    /// A 4.0 owner legitimately has two records between SETCLIENTID and
+    /// SETCLIENTID_CONFIRM (RFC 7530 §16.33.5): the confirmed incarnation that
+    /// still owns the open state, and the unconfirmed one that will replace it.
+    /// `clients` is a HashMap, so a search that considers both returns whichever
+    /// key hashes first — which made both callers order-dependent: SETCLIENTID
+    /// could hand back the *pending* record as though it were confirmed, and
+    /// SETCLIENTID_CONFIRM's `old != cid` guard could match the record it had
+    /// just confirmed and so never retire the previous incarnation, leaking its
+    /// open state and VFS handles.
+    ///
+    /// The pending record is identified by the `unconfirmed` index rather than
+    /// by `is_confirmed()`: a 4.1 record counts as unconfirmed until
+    /// CREATE_SESSION, but it is still the only record for its owner and
+    /// EXCHANGE_ID must keep finding it.
+    fn by_owner(&self, owner: &(Minor, Vec<u8>)) -> Option<clientid4> {
+        let pending = self.unconfirmed.get(owner).copied();
+        self.clients
+            .iter()
+            .find_map(|(id, c)| (&c.owner == owner && Some(*id) != pending).then_some(*id))
     }
 
     /// Create a record without touching any existing record for `owner` and
@@ -437,7 +504,8 @@ impl Inner {
                 verifier,
                 last_renewed: now,
                 kind,
-                open_owners: HashMap::new(),
+                opens: HashMap::new(),
+                open_index: HashMap::new(),
             },
         );
         cid
@@ -452,12 +520,10 @@ impl Inner {
         kind: ClientKind,
         now: Instant,
     ) -> clientid4 {
-        if let Some(&old) = self.by_owner.get(&owner) {
+        if let Some(old) = self.by_owner(&owner) {
             self.remove_client(old);
         }
-        let cid = self.add_client(owner.clone(), verifier, kind, now);
-        self.by_owner.insert(owner, cid);
-        cid
+        self.add_client(owner.clone(), verifier, kind, now)
     }
 
     fn sweep_expired(&mut self, now: Instant) {
@@ -470,6 +536,31 @@ impl Inner {
         for cid in dead {
             self.remove_client(cid);
         }
+    }
+
+    fn open(&self, cid: clientid4, other: &Other) -> Res<&Open> {
+        self.clients
+            .get(&cid)
+            .and_then(|c| c.opens.get(other))
+            .ok_or(nfsstat4::NFS4ERR_BAD_STATEID)
+    }
+
+    fn open_mut(&mut self, cid: clientid4, other: &Other) -> Res<&mut Open> {
+        self.clients
+            .get_mut(&cid)
+            .and_then(|c| c.opens.get_mut(other))
+            .ok_or(nfsstat4::NFS4ERR_BAD_STATEID)
+    }
+
+    /// The `Session` named by `sessionid`, resolved through the locator into
+    /// the client that owns it.
+    fn session_mut(&mut self, cid: clientid4, sessionid: &sessionid4) -> Res<&mut Session> {
+        let client = self.clients.get_mut(&cid).ok_or(nfsstat4::NFS4ERR_BADSESSION)?;
+        match &mut client.kind {
+            ClientKind::V41(v) => v.sessions.iter_mut().find(|s| s.id == *sessionid),
+            ClientKind::V40(_) => None,
+        }
+        .ok_or(nfsstat4::NFS4ERR_BADSESSION)
     }
 
     // -- 4.0 open-owner sequencing --
@@ -499,7 +590,12 @@ impl Inner {
             return Ok(OwnerSeq::Fresh);
         };
         let client = self.clients.get(&cid).expect("owner_seqid_for resolved it");
-        match client.open_owners.get(owner).and_then(|o| o.last.as_ref()) {
+        // `owner_seqid_for` yielded a seqid, so this is a 4.0 client.
+        let last = client
+            .open_owners()
+            .and_then(|owners| owners.get(owner))
+            .and_then(|o| o.last.as_ref());
+        match last {
             None => Ok(OwnerSeq::Fresh),
             Some((last, reply)) if seqid == *last => Ok(OwnerSeq::Replay(reply.clone())),
             Some((last, _)) if seqid == last.wrapping_add(1) => Ok(OwnerSeq::Fresh),
@@ -515,13 +611,11 @@ impl Inner {
         if matches!(&reply, Err(e) if seqid_retained(e)) {
             return;
         }
-        let Some(client) = self.clients.get_mut(&cid) else {
+        // Absent for a client that has gone away, or a 4.1 one.
+        let Some(owners) = self.clients.get_mut(&cid).and_then(Client::open_owners_mut) else {
             return;
         };
-        if !client.is_v40() {
-            return; // 4.1 keeps no open-owner state.
-        }
-        client.open_owners.entry(owner.to_vec()).or_default().last = Some((seqid, reply));
+        owners.entry(owner.to_vec()).or_default().last = Some((seqid, reply));
     }
 
     /// A request that consumed the seqid without producing a stateid. Returns
@@ -578,7 +672,9 @@ impl Inner {
         let Some(client) = self.clients.get(&cid) else {
             return false;
         };
-        client.is_v40() && !client.open_owners.get(owner).is_some_and(|o| o.confirmed)
+        client
+            .open_owners()
+            .is_some_and(|owners| !owners.get(owner).is_some_and(|o| o.confirmed))
     }
 
     // -- OPEN, in three phases --
@@ -610,12 +706,18 @@ impl Inner {
         }
 
         // Reuse the existing state if its handle is already strong enough.
-        if let Some(&other) = self.open_index.get(&(cid, owner.to_vec(), fileid)) {
-            let open = self.opens.get_mut(&other).expect("open_index points into opens");
-            if open.mode >= mode {
-                let stateid = open.bump(other);
-                return Ok(OpenPlan::Done(self.finish_open(cid, owner, owner_seqid, stateid)));
+        let reuse = {
+            let client = self.clients.get_mut(&cid).expect("still live");
+            match client.open_index.get(&(owner.to_vec(), fileid)).copied() {
+                Some(other) => {
+                    let open = client.opens.get_mut(&other).expect("open_index points into opens");
+                    (open.mode >= mode).then(|| open.bump(other))
+                },
+                None => None,
             }
+        };
+        if let Some(stateid) = reuse {
+            return Ok(OpenPlan::Done(self.finish_open(cid, owner, owner_seqid, stateid)));
         }
         Ok(OpenPlan::NeedHandle(mode))
     }
@@ -634,10 +736,11 @@ impl Inner {
     ) -> Res<Opened> {
         self.client_mut(cid, now)?;
 
-        let key = (cid, owner.to_vec(), fileid);
-        let stateid = match self.open_index.get(&key).copied() {
+        let key = (owner.to_vec(), fileid);
+        let existing = self.clients[&cid].open_index.get(&key).copied();
+        let stateid = match existing {
             Some(other) => {
-                let open = self.opens.get_mut(&other).expect("open_index points into opens");
+                let open = self.open_mut(cid, &other).expect("open_index points into opens");
                 if mode > open.mode {
                     open.mode = mode;
                     open.fh = fh; // the superseded handle closes on drop
@@ -646,10 +749,10 @@ impl Inner {
             },
             None => {
                 let other = self.fresh_other();
-                self.opens.insert(
+                let client = self.clients.get_mut(&cid).expect("still live");
+                client.opens.insert(
                     other,
                     Open {
-                        clientid: cid,
                         owner: owner.to_vec(),
                         fileid,
                         seqid: NonZeroU32::MIN,
@@ -657,7 +760,7 @@ impl Inner {
                         fh,
                     },
                 );
-                self.open_index.insert(key, other);
+                client.open_index.insert(key, other);
                 stateid4 { seqid: 1, other }
             },
         };
@@ -679,11 +782,7 @@ impl Inner {
         let StateRef::Open { other, seqid } = StateRef::from(sid) else {
             return Err(nfsstat4::NFS4ERR_BAD_STATEID);
         };
-        let open = self.opens.get(&other).ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
-        if open.clientid != cid {
-            return Err(nfsstat4::NFS4ERR_BAD_STATEID);
-        }
-        let owner = open.owner.clone();
+        let owner = self.open(cid, &other)?.owner.clone();
         let client = self.client_mut(cid, now)?;
         client.kind.v40_mut()?; // there is no OPEN_CONFIRM in 4.1
         client.last_renewed = now;
@@ -695,13 +794,14 @@ impl Inner {
         // below still applies, and that failure consumes the seqid —
         // OLD_STATEID is not on `seqid_retained`'s list.
         self.with_owner_seqid(cid, &owner, OwnerSeqid::V40(owner_seqid), |s| {
-            let open = s.opens.get_mut(&other).ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
+            let open = s.open_mut(cid, &other)?;
             open.check_seqid(seqid)?;
             let stateid = open.bump(other);
             s.clients
                 .get_mut(&cid)
                 .expect("still live")
-                .open_owners
+                .open_owners_mut()
+                .expect("v40_mut succeeded above")
                 .entry(owner.clone())
                 .or_default()
                 .confirmed = true;
@@ -731,7 +831,7 @@ impl Inner {
             self.remove_client(stale);
         }
 
-        if let Some(&cid) = self.by_owner.get(&owner) {
+        if let Some(cid) = self.by_owner(&owner) {
             if self
                 .clients
                 .get(&cid)
@@ -746,10 +846,7 @@ impl Inner {
 
         // New client, or one whose verifier changed (reboot). The previous
         // incarnation's state survives until SETCLIENTID_CONFIRM proves it.
-        let kind = ClientKind::V40(V40 {
-            confirm_verifier: confirm,
-            confirmed: false,
-        });
+        let kind = ClientKind::V40(V40::new(confirm));
         let cid = self.add_client(owner.clone(), *verifier, kind, now);
         self.unconfirmed.insert(owner, cid);
         (cid, confirm)
@@ -773,14 +870,15 @@ impl Inner {
 
         if !already {
             // The reboot is now proven, so — and only now — the previous
-            // incarnation and its state go away.
-            if let Some(&old) = self.by_owner.get(&owner) {
+            // incarnation and its state go away. `by_owner` must be consulted
+            // while this record is still in `unconfirmed`, so that it masks
+            // this record and can only return the incarnation being replaced.
+            if let Some(old) = self.by_owner(&owner) {
                 if old != cid {
                     self.remove_client(old);
                 }
             }
             self.unconfirmed.remove(&owner);
-            self.by_owner.insert(owner, cid);
         }
         Ok(())
     }
@@ -800,10 +898,10 @@ impl Inner {
 
         self.with_owner_seqid(cid, &owner, owner_seqid, |s| {
             // Fresh seqid on a state that is already closed: nothing to release.
-            let open = s.opens.get_mut(&other).ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
+            let open = s.open_mut(cid, &other)?;
             open.check_seqid(seqid)?;
             let stateid = open.bump(other);
-            s.remove_open(&other);
+            s.remove_open(cid, &other);
             s.retire_open(cid, &owner, other);
             Ok(stateid)
         })
@@ -812,14 +910,13 @@ impl Inner {
     /// The open-owner of `other`, live or just-retired - but only if `cid`
     /// actually owns it.
     fn owner_of(&self, cid: clientid4, other: &Other) -> Res<Vec<u8>> {
-        let (holder, owner) = match self.opens.get(other) {
-            Some(open) => (open.clientid, open.owner.clone()),
-            None => self.retired.get(other).cloned().ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?,
-        };
-        if holder != cid {
-            return Err(nfsstat4::NFS4ERR_BAD_STATEID);
+        if let Ok(open) = self.open(cid, other) {
+            return Ok(open.owner.clone());
         }
-        Ok(owner)
+        match self.retired.get(other) {
+            Some((holder, owner)) if *holder == cid => Ok(owner.clone()),
+            _ => Err(nfsstat4::NFS4ERR_BAD_STATEID),
+        }
     }
 
     fn resolve(&mut self, cid: clientid4, sid: &stateid4, now: Instant) -> Res<Resolved> {
@@ -827,12 +924,8 @@ impl Inner {
             StateRef::Anonymous => Ok(Resolved::Anonymous),
             StateRef::Bypass => Ok(Resolved::Bypass),
             StateRef::Open { other, seqid } => {
-                let open = self.opens.get(&other).ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
-                if open.clientid != cid {
-                    return Err(nfsstat4::NFS4ERR_BAD_STATEID);
-                }
+                let open = self.open(cid, &other)?;
                 open.check_seqid(seqid)?;
-                let cid = open.clientid;
                 let resolved = Resolved::Open {
                     fileid: open.fileid,
                     fh: open.fh.clone(),
@@ -844,9 +937,11 @@ impl Inner {
         }
     }
 
-    fn remove_open(&mut self, other: &Other) {
-        if let Some(open) = self.opens.remove(other) {
-            self.open_index.remove(&(open.clientid, open.owner, open.fileid));
+    fn remove_open(&mut self, cid: clientid4, other: &Other) {
+        if let Some(client) = self.clients.get_mut(&cid) {
+            if let Some(open) = client.opens.remove(other) {
+                client.open_index.remove(&(open.owner, open.fileid));
+            }
         }
     }
 
@@ -855,55 +950,86 @@ impl Inner {
     /// cache and keeps no open-owner state at all.
     fn retire_open(&mut self, cid: clientid4, owner: &[u8], other: Other) {
         let previous = {
-            let Some(client) = self.clients.get_mut(&cid) else {
+            // 4.1 replays a retransmitted CLOSE from the slot cache, so it
+            // needs no tombstone and has nowhere to put one.
+            let Some(owners) = self.clients.get_mut(&cid).and_then(Client::open_owners_mut) else {
                 return;
             };
-            if !client.is_v40() {
-                return;
-            }
-            client.open_owners.entry(owner.to_vec()).or_default().retired.replace(other)
+            owners.entry(owner.to_vec()).or_default().retired.replace(other)
         };
         if let Some(prev) = previous {
             self.retired.remove(&prev);
         }
         self.retired.insert(other, (cid, owner.to_vec()));
     }
+}
 
-    #[cfg(debug_assertions)]
+#[cfg(test)]
+impl Inner {
+    fn open_of(&self, other: &Other) -> &Open {
+        self.clients.iter().find_map(|(_, c)| c.opens.get(other)).unwrap()
+    }
+
+    fn open_of_mut(&mut self, other: &Other) -> &mut Open {
+        self.clients.iter_mut().find_map(|(_, c)| c.opens.get_mut(other)).unwrap()
+    }
+
+    fn open_index_len(&self) -> usize {
+        self.clients.values().map(|c| c.open_index.len()).sum()
+    }
+
+    fn sessions(&self) -> Vec<&Session> {
+        self.clients
+            .iter()
+            .filter_map(|(_, c)| {
+                if let ClientKind::V41(v41) = &c.kind {
+                    Some(v41.sessions.iter())
+                } else {
+                    None
+                }
+            })
+            .flatten()
+            .collect::<Vec<_>>()
+    }
+
+    fn opens(&self) -> Vec<&Open> {
+        self.clients.iter().map(|(_, c)| c.opens.values()).flatten().collect()
+    }
+
     fn assert_invariants(&self) {
-        for (other, open) in &self.opens {
-            assert!(self.clients.contains_key(&open.clientid), "orphaned open state");
-            let key = (open.clientid, open.owner.clone(), open.fileid);
-            assert_eq!(self.open_index.get(&key), Some(other), "open_index out of sync");
-        }
-        assert_eq!(self.open_index.len(), self.opens.len());
-        for session in self.sessions.values() {
-            assert!(self.clients.contains_key(&session.clientid), "orphaned session");
-        }
-        for (owner, cid) in &self.by_owner {
-            assert_eq!(self.clients.get(cid).map(|c| &c.owner), Some(owner), "by_owner out of sync");
-        }
-        for client in self.clients.values() {
-            assert!(
-                client.is_v40() || client.open_owners.is_empty(),
-                "4.1 client must not accumulate open-owner state"
-            );
+        for (_, client) in &self.clients {
+            for (other, open) in &client.opens {
+                assert_eq!(
+                    client.open_index.get(&(open.owner.clone(), open.fileid)),
+                    Some(other),
+                    "open_index out of sync"
+                );
+            }
+            assert_eq!(client.open_index.len(), client.opens.len());
         }
         for (other, (cid, owner)) in &self.retired {
             let client = self.clients.get(cid).expect("orphaned retired stateid");
-            assert!(client.is_v40(), "4.1 keeps no retired stateids");
-            assert_eq!(
-                client.open_owners.get(owner).and_then(|o| o.retired),
-                Some(*other),
-                "retired index out of sync"
-            );
-            assert!(!self.opens.contains_key(other), "retired stateid is still live");
+            let owners = client.open_owners().expect("4.1 keeps no retired stateids");
+            assert_eq!(owners.get(owner).and_then(|o| o.retired), Some(*other), "retired index out of sync");
+            assert!(self.open(*cid, other).is_err(), "retired stateid is still live");
         }
         for (owner, cid) in &self.unconfirmed {
             assert_eq!(self.clients.get(cid).map(|c| &c.owner), Some(owner), "unconfirmed out of sync");
             assert!(!self.clients[cid].is_confirmed(), "confirmed client in the unconfirmed index");
-            assert_ne!(self.by_owner.get(owner), Some(cid), "record cannot be in both indexes");
+            assert_ne!(self.by_owner(owner), Some(*cid), "record cannot be in both indexes");
         }
+
+        // At most one *current* record per owner, plus at most one pending
+        // SETCLIENTID attempt. Two current records would make `by_owner`
+        // depend on HashMap iteration order again.
+        let mut current: HashMap<&(Minor, Vec<u8>), usize> = HashMap::new();
+        for (cid, client) in &self.clients {
+            if self.unconfirmed.get(&client.owner) == Some(cid) {
+                continue;
+            }
+            *current.entry(&client.owner).or_default() += 1;
+        }
+        assert!(current.values().all(|n| *n == 1), "two current records for one client owner");
     }
 }
 
@@ -970,7 +1096,7 @@ impl NFS4State {
         let mut g = self.lock();
         let owner = (Minor::V41, ownerid.to_vec());
 
-        if let Some(&cid) = g.by_owner.get(&owner) {
+        if let Some(cid) = g.by_owner(&owner) {
             let client = &g.clients[&cid];
             if client.verifier == *verifier && client.is_live(now, g.lease) {
                 let seq = match &client.kind {
@@ -1004,7 +1130,7 @@ impl NFS4State {
         client.last_renewed = now;
         let v41 = client.kind.v41_mut()?;
         let expected = v41.create_session_seq;
-        let last = v41.sessions.last().copied();
+        let last = v41.sessions.last().map(|s| s.id);
 
         if csa_sequence == expected.wrapping_sub(1) {
             // Replay of the previous CREATE_SESSION.
@@ -1016,40 +1142,32 @@ impl NFS4State {
 
         let sessionid = g.fresh_sessionid();
         let slots = vec![Slot::default(); num_slots.clamp(1, MAX_SLOTS) as usize].into_boxed_slice();
-        g.sessions.insert(
-            sessionid,
-            Session {
-                clientid: cid,
-                slots,
-                max_cached,
-            },
-        );
 
         let v41 = g.clients.get_mut(&cid).expect("still live").kind.v41_mut()?;
         v41.create_session_seq = expected.wrapping_add(1);
-        v41.sessions.push(sessionid);
+        v41.sessions.push(Session {
+            id: sessionid,
+            slots,
+            max_cached,
+        });
         Ok(CreateSession::New(sessionid))
     }
 
-    /// The client owning a session, for ops that need it after SEQUENCE.
-    pub(super) fn session_client(&self, sessionid: &sessionid4) -> Res<clientid4> {
-        self.lock()
-            .sessions
-            .get(sessionid)
-            .map(|s| s.clientid)
-            .ok_or(nfsstat4::NFS4ERR_BADSESSION)
-    }
-
     /// SEQUENCE slot check. Renews the lease on any accepted request.
-    pub(super) fn sequence(&self, sessionid: &sessionid4, slotid: slotid4, seqid: sequenceid4) -> Res<Sequence> {
+    pub(super) fn sequence(
+        &self,
+        cid: clientid4,
+        sessionid: &sessionid4,
+        slotid: slotid4,
+        seqid: sequenceid4,
+    ) -> Res<Sequence> {
         let now = Instant::now();
         let mut g = self.lock();
 
-        let cid = g.sessions.get(sessionid).ok_or(nfsstat4::NFS4ERR_BADSESSION)?.clientid;
         // An expired client takes its sessions with it.
         g.client_mut(cid, now).map_err(|_| nfsstat4::NFS4ERR_BADSESSION)?;
 
-        let session = g.sessions.get_mut(sessionid).expect("just resolved");
+        let session = g.session_mut(cid, sessionid)?;
         let slot = session.slots.get_mut(slotid as usize).ok_or(nfsstat4::NFS4ERR_BADSLOT)?;
 
         let outcome = if seqid == slot.last_seqid {
@@ -1071,11 +1189,19 @@ impl NFS4State {
 
     /// Cache an encoded COMPOUND4res for a slot (`sa_cachethis`). Oversized
     /// replies are dropped; a replay then gets `RetryUncached`.
-    pub(super) fn cache_reply(&self, sessionid: &sessionid4, slotid: slotid4, seqid: sequenceid4, reply: Vec<u8>) {
+    pub(super) fn cache_reply(
+        &self,
+        cid: clientid4,
+        sessionid: &sessionid4,
+        slotid: slotid4,
+        seqid: sequenceid4,
+        reply: Vec<u8>,
+    ) {
         let mut g = self.lock();
-        let Some(session) = g.sessions.get_mut(sessionid) else {
+        let Ok(session) = g.session_mut(cid, sessionid) else {
             return;
         };
+
         if reply.len() as u64 > session.max_cached as u64 {
             return;
         }
@@ -1087,13 +1213,10 @@ impl NFS4State {
     }
 
     /// DESTROY_SESSION.
-    pub(super) fn destroy_session(&self, sessionid: &sessionid4) -> Res<()> {
+    pub(super) fn destroy_session(&self, cid: clientid4, sessionid: &sessionid4) -> Res<()> {
         let mut g = self.lock();
-        let session = g.sessions.remove(sessionid).ok_or(nfsstat4::NFS4ERR_BADSESSION)?;
-        if let Some(client) = g.clients.get_mut(&session.clientid) {
-            if let ClientKind::V41(v) = &mut client.kind {
-                v.sessions.retain(|s| s != sessionid);
-            }
+        if let Some(ClientKind::V41(v)) = g.clients.get_mut(&cid).map(|c| &mut c.kind) {
+            v.sessions.retain(|s| s.id != *sessionid);
         }
         Ok(())
     }
@@ -1112,10 +1235,15 @@ impl NFS4State {
     /// RECLAIM_COMPLETE. Nothing to reclaim without persistent state, so this
     /// only validates the session and renews the lease. OPEN must therefore
     /// always reject CLAIM_PREVIOUS with NFS4ERR_NO_GRACE.
-    pub(super) fn reclaim_complete(&self, sessionid: &sessionid4) -> Res<()> {
+    pub(super) fn reclaim_complete(&self, cid: clientid4, sessionid: &sessionid4) -> Res<()> {
         let now = Instant::now();
         let mut g = self.lock();
-        let cid = g.sessions.get(sessionid).ok_or(nfsstat4::NFS4ERR_BADSESSION)?.clientid;
+        let client = g.clients.get(&cid).ok_or(nfsstat4::NFS4ERR_STALE_CLIENTID)?;
+        if let ClientKind::V41(v41) = &client.kind {
+            if v41.sessions.iter().find(|s| &s.id == sessionid).is_none() {
+                return Err(nfsstat4::NFS4ERR_BADSESSION);
+            }
+        }
         g.client_mut(cid, now)?.last_renewed = now;
         Ok(())
     }
@@ -1249,12 +1377,16 @@ mod tests {
         Inner::new(LEASE, getrandom::u32().expect("OS RNG failure"))
     }
 
-    fn confirmed_v40_client(inner: &mut Inner, now: Instant) -> clientid4 {
-        let kind = ClientKind::V40(V40 {
-            confirm_verifier: verifier4::default(),
+    /// A confirmed 4.0 record, as SETCLIENTID_CONFIRM would leave it.
+    fn v40_confirmed() -> ClientKind {
+        ClientKind::V40(V40 {
             confirmed: true,
-        });
-        inner.install_client((Minor::V40, b"owner".to_vec()), verifier4::default(), kind, now)
+            ..V40::new(verifier4::default())
+        })
+    }
+
+    fn confirmed_v40_client(inner: &mut Inner, now: Instant) -> clientid4 {
+        inner.install_client((Minor::V40, b"owner".to_vec()), verifier4::default(), v40_confirmed(), now)
     }
 
     /// A 4.1 client is confirmed by owning a session, so give it one.
@@ -1265,14 +1397,6 @@ mod tests {
         });
         let cid = inner.install_client((Minor::V41, b"owner41".to_vec()), verifier4::default(), kind, now);
         let sessionid = inner.fresh_sessionid();
-        inner.sessions.insert(
-            sessionid,
-            Session {
-                clientid: cid,
-                slots: vec![Slot::default()].into_boxed_slice(),
-                max_cached: 4096,
-            },
-        );
         inner
             .clients
             .get_mut(&cid)
@@ -1281,7 +1405,11 @@ mod tests {
             .v41_mut()
             .expect("v41")
             .sessions
-            .push(sessionid);
+            .push(Session {
+                id: sessionid,
+                slots: vec![Slot::default()].into_boxed_slice(),
+                max_cached: 4096,
+            });
         cid
     }
 
@@ -1308,8 +1436,8 @@ mod tests {
 
         assert_eq!(first.stateid.other, second.stateid.other, "one state per (owner, file)");
         assert_eq!(second.stateid.seqid, 2);
-        assert_eq!(inner.opens.len(), 1);
-        assert_eq!(inner.opens[&second.stateid.other].mode, OpenMode::ReadWrite);
+        assert_eq!(inner.opens().len(), 1);
+        assert_eq!(inner.open_of(&second.stateid.other).mode, OpenMode::ReadWrite);
 
         // A ReadOnly OPEN is now satisfied without touching the VFS.
         assert!(matches!(
@@ -1317,8 +1445,8 @@ mod tests {
             Ok(OpenPlan::Done(_))
         ));
 
-        inner.remove_open(&second.stateid.other);
-        assert!(inner.opens.is_empty() && inner.open_index.is_empty());
+        inner.remove_open(cid, &second.stateid.other);
+        assert!(inner.opens().is_empty() && inner.open_index_len() == 0);
         inner.assert_invariants();
     }
 
@@ -1343,7 +1471,7 @@ mod tests {
         let closed_sid = inner.close(cid, &opened.stateid, OwnerSeqid::V40(1), now).unwrap();
         assert_eq!(closed_sid.other, opened.stateid.other);
         assert_eq!(closed_sid.seqid, 2, "CLOSE bumps the stateid; it did not replay the OPEN");
-        assert!(inner.opens.is_empty() && inner.open_index.is_empty());
+        assert!(inner.opens().is_empty() && inner.open_index_len() == 0);
         assert_eq!(closed.try_recv().ok(), Some(11), "CLOSE must hand the handle to the closer");
         assert!(inner.retired.is_empty(), "4.1 needs no CLOSE tombstone");
         inner.assert_invariants();
@@ -1369,7 +1497,7 @@ mod tests {
             .unwrap();
 
         assert_ne!(a.stateid.other, b.stateid.other, "one state per file, not per open-owner");
-        assert_eq!(inner.opens.len(), 2);
+        assert_eq!(inner.opens().len(), 2);
         inner.assert_invariants();
     }
 
@@ -1382,7 +1510,8 @@ mod tests {
             .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadOnly, handle(), now)
             .unwrap();
 
-        assert!(inner.clients[&cid].open_owners.is_empty());
+        // Structural, not merely empty: a 4.1 record has no open-owner table.
+        assert!(inner.clients[&cid].open_owners().is_none());
         assert!(matches!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(1)), Ok(OwnerSeq::Fresh)));
         assert!(matches!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V41), Ok(OwnerSeq::Fresh)));
     }
@@ -1408,14 +1537,14 @@ mod tests {
             .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadOnly, handle(), now)
             .unwrap();
 
-        let open = &inner.opens[&opened.stateid.other];
+        let open = inner.open_of(&opened.stateid.other);
         assert_eq!(open.check_seqid(None), Ok(())); // 0 == current
         assert_eq!(open.check_seqid(NonZeroU32::new(1)), Ok(()));
         assert_eq!(open.check_seqid(NonZeroU32::new(2)), Err(nfsstat4::NFS4ERR_BAD_STATEID));
 
-        inner.opens.get_mut(&opened.stateid.other).unwrap().bump(opened.stateid.other);
+        inner.open_of_mut(&opened.stateid.other).bump(opened.stateid.other);
         assert_eq!(
-            inner.opens[&opened.stateid.other].check_seqid(NonZeroU32::new(1)),
+            inner.open_of(&opened.stateid.other).check_seqid(NonZeroU32::new(1)),
             Err(nfsstat4::NFS4ERR_OLD_STATEID)
         );
     }
@@ -1650,8 +1779,8 @@ mod tests {
 
         let later = now + LEASE + Duration::from_secs(1);
         assert_eq!(inner.client_mut(cid, later).err(), Some(nfsstat4::NFS4ERR_EXPIRED));
-        assert!(inner.clients.is_empty() && inner.opens.is_empty() && inner.open_index.is_empty());
-        assert!(inner.by_owner.is_empty() && inner.retired.is_empty());
+        assert!(inner.clients.is_empty() && inner.opens().is_empty() && inner.open_index_len() == 0);
+        assert!(inner.retired.is_empty());
         assert_eq!(closed.try_recv().ok(), Some(11), "expiry must close the handle too");
         drop(opened);
         inner.assert_invariants();
@@ -1661,15 +1790,7 @@ mod tests {
     fn versions_do_not_share_an_owner_namespace() {
         let now = Instant::now();
         let mut inner = inner();
-        let a = inner.install_client(
-            (Minor::V40, b"same".to_vec()),
-            verifier4::default(),
-            ClientKind::V40(V40 {
-                confirm_verifier: verifier4::default(),
-                confirmed: true,
-            }),
-            now,
-        );
+        let a = inner.install_client((Minor::V40, b"same".to_vec()), verifier4::default(), v40_confirmed(), now);
         let b = inner.install_client(
             (Minor::V41, b"same".to_vec()),
             verifier4::default(),
@@ -1731,11 +1852,11 @@ mod tests {
         // Retry, same verifier: same clientid, state untouched.
         let (again, confirm2) = inner.setclientid(b"host", &v1, now);
         assert_eq!(again, cid, "an unrebooted client keeps its clientid");
-        assert_eq!(inner.opens.len(), 1, "SETCLIENTID must not destroy open state");
+        assert_eq!(inner.opens().len(), 1, "SETCLIENTID must not destroy open state");
         assert!(matches!(inner.resolve(cid, &opened.stateid, Instant::now()), Ok(Resolved::Open { .. })));
         assert!(closed.try_recv().is_err(), "the handle must not be closed");
         inner.setclientid_confirm(cid, &confirm2, now).unwrap();
-        assert_eq!(inner.opens.len(), 1, "confirming a retry must not destroy it either");
+        assert_eq!(inner.opens().len(), 1, "confirming a retry must not destroy it either");
         inner.assert_invariants();
 
         // Reboot: a different verifier gets a new, unconfirmed record, and the
@@ -1744,18 +1865,54 @@ mod tests {
         v2[0] ^= 1;
         let (rebooted, confirm3) = inner.setclientid(b"host", &v2, now);
         assert_ne!(rebooted, cid);
-        assert_eq!(inner.by_owner.get(&owner), Some(&cid), "confirmed record still current");
+        assert_eq!(inner.by_owner(&owner), Some(cid), "confirmed record still current");
         assert_eq!(inner.unconfirmed.get(&owner), Some(&rebooted));
         assert!(matches!(inner.resolve(cid, &opened.stateid, Instant::now()), Ok(Resolved::Open { .. })));
         inner.assert_invariants();
 
         inner.setclientid_confirm(rebooted, &confirm3, now).unwrap();
         assert!(!inner.clients.contains_key(&cid), "the old incarnation is gone");
-        assert!(inner.opens.is_empty() && inner.open_index.is_empty());
+        assert!(inner.opens().is_empty() && inner.open_index_len() == 0);
         assert_eq!(closed.try_recv().ok(), Some(11), "the reboot closes the handle");
-        assert_eq!(inner.by_owner.get(&owner), Some(&rebooted));
+        assert_eq!(inner.by_owner(&owner), Some(rebooted));
         assert!(inner.unconfirmed.is_empty());
         inner.assert_invariants();
+    }
+
+    /// `by_owner` must name the *confirmed* incarnation while a reboot attempt
+    /// is pending, whatever order `clients` happens to iterate in. This used to
+    /// be a coin flip, which both flaked the test above and — via
+    /// SETCLIENTID_CONFIRM's `old != cid` guard — sometimes left the previous
+    /// incarnation and its open handles behind for good.
+    #[test]
+    fn by_owner_ignores_a_pending_setclientid() {
+        let now = Instant::now();
+        let owner = (Minor::V40, b"host".to_vec());
+
+        // Repeat: one clientid pair per iteration, so any order-dependence shows.
+        for _ in 0..64 {
+            let mut inner = inner();
+            let v1 = verifier4::default();
+            let (cid, confirm) = inner.setclientid(b"host", &v1, now);
+            inner.setclientid_confirm(cid, &confirm, now).unwrap();
+            inner
+                .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadWrite, handle(), now)
+                .unwrap();
+
+            let mut v2 = v1;
+            v2[0] ^= 1;
+            let (rebooted, confirm2) = inner.setclientid(b"host", &v2, now);
+            assert_ne!(rebooted, cid);
+            assert_eq!(inner.clients.len(), 2, "both incarnations coexist until the confirm");
+            assert_eq!(inner.by_owner(&owner), Some(cid), "the pending record must not shadow the current one");
+            inner.assert_invariants();
+
+            inner.setclientid_confirm(rebooted, &confirm2, now).unwrap();
+            assert_eq!(inner.by_owner(&owner), Some(rebooted));
+            assert!(!inner.clients.contains_key(&cid), "the old incarnation must be retired");
+            assert!(inner.opens().is_empty(), "and its state released");
+            inner.assert_invariants();
+        }
     }
 
     #[test]
@@ -1801,7 +1958,7 @@ mod tests {
         // A genuine lapse still expires, and takes the open state with it.
         let dead = later + LEASE + Duration::from_secs(1);
         assert_eq!(inner.resolve(cid, &opened.stateid, dead).err(), Some(nfsstat4::NFS4ERR_EXPIRED));
-        assert!(inner.clients.is_empty() && inner.opens.is_empty());
+        assert!(inner.clients.is_empty() && inner.opens().is_empty());
         inner.assert_invariants();
     }
 
@@ -1813,15 +1970,8 @@ mod tests {
         let now = Instant::now();
         let mut inner = inner();
         let victim = confirmed_v40_client(&mut inner, now);
-        let attacker = inner.install_client(
-            (Minor::V40, b"attacker".to_vec()),
-            verifier4::default(),
-            ClientKind::V40(V40 {
-                confirm_verifier: verifier4::default(),
-                confirmed: true,
-            }),
-            now,
-        );
+        let attacker =
+            inner.install_client((Minor::V40, b"attacker".to_vec()), verifier4::default(), v40_confirmed(), now);
 
         let (fh, mut closed) = tracked_handle(11);
         let opened = inner
@@ -1881,6 +2031,57 @@ mod tests {
 
         // ...and the legitimate next request is still accepted.
         assert_eq!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(4)), Ok(OwnerSeq::Fresh));
+        inner.assert_invariants();
+    }
+
+    /// State belongs to its client rather than to a server-wide table: removing
+    /// one client must retract exactly its own locator entries — opens,
+    /// tombstones and sessions — and leave every other client's untouched. The
+    /// previous `retain`-based sweep only worked because each record carried a
+    /// redundant clientid, and forgetting one table leaked silently.
+    #[test]
+    fn client_owns_its_state() {
+        let now = Instant::now();
+        let mut inner = inner();
+        let a = confirmed_v40_client(&mut inner, now);
+        let b = inner.install_client((Minor::V40, b"other".to_vec()), verifier4::default(), v40_confirmed(), now);
+        let c = confirmed_v41_client(&mut inner, now);
+
+        // `a` gets one live open and one tombstone.
+        let (fh, mut closed) = tracked_handle(11);
+        let live = inner
+            .open_commit(a, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadOnly, fh, now)
+            .unwrap();
+        let gone = inner
+            .open_commit(a, b"oo2", OwnerSeqid::V40(1), 43, OpenMode::ReadOnly, handle(), now)
+            .unwrap();
+        inner.close(a, &gone.stateid, OwnerSeqid::V40(2), now).unwrap();
+
+        // `b` opens the same file under the same open-owner *name*: the
+        // namespace is per-client, so this is a distinct state.
+        let theirs = inner
+            .open_commit(b, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadOnly, handle(), now)
+            .unwrap();
+        assert_ne!(live.stateid.other, theirs.stateid.other);
+
+        assert_eq!(inner.clients[&a].opens.len(), 1);
+        assert_eq!(inner.clients[&a].open_index.len(), 1);
+        assert_eq!(inner.opens().len(), 2, "one locator entry per live open");
+        assert_eq!(inner.sessions().len(), 1);
+        inner.assert_invariants();
+
+        inner.remove_client(a);
+
+        assert!(!inner.retired.contains_key(&gone.stateid.other), "tombstone not retracted");
+        assert_eq!(closed.try_recv().ok(), Some(11), "removal must close the handle");
+
+        // Everything belonging to the other clients survived.
+        assert_eq!(inner.open_index_len(), 1);
+        assert_eq!(inner.sessions().len(), 1, "the 4.1 client keeps its session");
+        inner.assert_invariants();
+
+        inner.remove_client(c);
+        assert!(inner.sessions().is_empty(), "session locator not retracted");
         inner.assert_invariants();
     }
 }
