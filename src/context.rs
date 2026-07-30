@@ -1,7 +1,7 @@
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
-use crate::nfs4::NFS4State;
+use crate::nfs4::{clientid4, NFS4State};
 use crate::transaction_tracker::TransactionTracker;
 use crate::vfs::NFSFileSystem;
 use tokio::sync::mpsc;
@@ -17,6 +17,23 @@ pub struct RPCContext {
     pub transaction_tracker: Arc<TransactionTracker>,
     pub epoch: u32,
     pub(crate) nfs4_state: Arc<NFS4State>,
+    pub(super) client_id: Arc<Mutex<Option<clientid4>>>,
+}
+
+impl RPCContext {
+    pub(crate) fn set_client_id(&self, client_id: clientid4) {
+        let mut guard = self.client_id.lock().unwrap();
+        *guard = Some(client_id);
+    }
+
+    pub(crate) fn clear_client_id(&self) {
+        let mut guard = self.client_id.lock().unwrap();
+        *guard = None;
+    }
+
+    pub(crate) fn client_id(&self) -> Option<clientid4> {
+        *self.client_id.lock().unwrap()
+    }
 }
 
 impl fmt::Debug for RPCContext {

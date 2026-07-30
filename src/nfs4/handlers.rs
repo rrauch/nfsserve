@@ -186,7 +186,8 @@ fn check_stateid(
     need: Need,
 ) -> Result<Option<ManagedFileHandle>, OpError> {
     use super::state::Resolved;
-    match context.nfs4_state.resolve(stateid)? {
+    let cid = context.client_id().ok_or_else(|| nfsstat4::NFS4ERR_BAD_STATEID)?;
+    match context.nfs4_state.resolve(cid, stateid)? {
         Resolved::Anonymous | Resolved::Bypass => Ok(None),
         Resolved::Open {
             fileid: sid_fileid,
@@ -468,6 +469,8 @@ async fn op_exchange_id(input: &mut impl Read, op_out: &mut impl Write, context:
         .nfs4_state
         .exchange_id(&args.eia_clientowner.co_ownerid, &args.eia_clientowner.co_verifier);
 
+    context.set_client_id(clientid);
+
     let resok = EXCHANGE_ID4resok {
         eir_clientid: clientid,
         eir_sequenceid: seqid,
@@ -596,6 +599,7 @@ async fn op_destroy_clientid(
     debug!("OP_DESTROY_CLIENTID clientid={:#x}", args.dca_clientid);
 
     context.nfs4_state.destroy_clientid(args.dca_clientid)?;
+    context.clear_client_id();
     nfsstat4::NFS4_OK.serialize(op_out)?;
     Ok(())
 }
@@ -1148,7 +1152,8 @@ async fn op_close(
         OwnerSeqid::V41
     };
 
-    let stateid = context.nfs4_state.close(&args.open_stateid, seqid)?;
+    let cid = context.client_id().ok_or_else(|| nfsstat4::NFS4ERR_BAD_STATEID)?;
+    let stateid = context.nfs4_state.close(cid, &args.open_stateid, seqid)?;
     nfsstat4::NFS4_OK.serialize(op_out)?;
     stateid.serialize(op_out)?;
     Ok(())
@@ -1508,11 +1513,12 @@ async fn op_test_stateid(
     state.require_session()?;
 
     debug!("OP_TEST_STATEID count={}", args.ts_stateids.len());
+    let cid = context.client_id().ok_or_else(|| nfsstat4::NFS4ERR_BAD_STATEID)?;
 
     let codes: Vec<nfsstat4> = args
         .ts_stateids
         .iter()
-        .map(|sid| context.nfs4_state.test_stateid(sid))
+        .map(|sid| context.nfs4_state.test_stateid(cid, sid))
         .collect();
 
     let resok = TEST_STATEID4resok {
@@ -1566,6 +1572,7 @@ async fn op_setclientid_confirm(
     context
         .nfs4_state
         .setclientid_confirm(args.clientid, &args.setclientid_confirm)?;
+    context.set_client_id(args.clientid);
     nfsstat4::NFS4_OK.serialize(op_out)?;
     Ok(())
 }
@@ -1597,8 +1604,8 @@ async fn op_open_confirm(
     state.current_fh()?; // require FH
 
     debug!("OP_OPEN_CONFIRM seqid={} stateid.other={:x?}", args.seqid, args.open_stateid.other);
-
-    let stateid = context.nfs4_state.open_confirm(&args.open_stateid, args.seqid)?;
+    let cid = context.client_id().ok_or_else(|| nfsstat4::NFS4ERR_BAD_STATEID)?;
+    let stateid = context.nfs4_state.open_confirm(cid, &args.open_stateid, args.seqid)?;
     let resok = OPEN_CONFIRM4resok { open_stateid: stateid };
     nfsstat4::NFS4_OK.serialize(op_out)?;
     resok.serialize(op_out)?;

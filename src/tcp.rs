@@ -1,6 +1,6 @@
 use std::io;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use anyhow;
@@ -217,6 +217,7 @@ impl<T: NFSFileSystem + Send + Sync + 'static> NFSTcp for NFSTcpListener<T> {
                 transaction_tracker: self.transaction_tracker.clone(),
                 epoch: self.epoch,
                 nfs4_state: self.nfs4_state.clone(),
+                client_id: Arc::new(Mutex::new(None)),
             };
             info!("Accepting connection from {}", context.client_addr);
             debug!("Accepting socket {:?} {:?}", socket, context);

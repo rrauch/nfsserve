@@ -678,14 +678,15 @@ impl Inner {
     // -- OPEN_CONFIRM and CLOSE --
 
     /// OPEN_CONFIRM. 4.0 only.
-    fn open_confirm(&mut self, sid: &stateid4, owner_seqid: seqid4, now: Instant) -> Res<stateid4> {
+    fn open_confirm(&mut self, cid: clientid4, sid: &stateid4, owner_seqid: seqid4, now: Instant) -> Res<stateid4> {
         let StateRef::Open { other, seqid } = StateRef::from(sid) else {
             return Err(nfsstat4::NFS4ERR_BAD_STATEID);
         };
-        let (cid, owner) = {
-            let open = self.opens.get(&other).ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
-            (open.clientid, open.owner.clone())
-        };
+        let open = self.opens.get(&other).ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
+        if open.clientid != cid {
+            return Err(nfsstat4::NFS4ERR_BAD_STATEID);
+        }
+        let owner = open.owner.clone();
         let client = self.client_mut(cid, now)?;
         client.kind.v40_mut()?; // there is no OPEN_CONFIRM in 4.1
         client.last_renewed = now;
@@ -790,17 +791,14 @@ impl Inner {
     /// CLOSE. Releases the whole open state and returns the bumped stateid.
     /// Dropping the `Open` hands its handle to the background closer, so the
     /// replay short-circuit must only fire for a genuine 4.0 retransmit.
-    fn close(&mut self, sid: &stateid4, owner_seqid: OwnerSeqid, now: Instant) -> Res<stateid4> {
+    fn close(&mut self, cid: clientid4, sid: &stateid4, owner_seqid: OwnerSeqid, now: Instant) -> Res<stateid4> {
         let StateRef::Open { other, seqid } = StateRef::from(sid) else {
             return Err(nfsstat4::NFS4ERR_BAD_STATEID);
         };
 
         // The state may already be gone: a retransmitted CLOSE must still reach
         // the open-owner record, and CLOSE4args names no owner of its own.
-        let (cid, owner) = match self.opens.get(&other) {
-            Some(open) => (open.clientid, open.owner.clone()),
-            None => self.retired.get(&other).cloned().ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?,
-        };
+        let owner = self.owner_of(cid, &other)?;
         self.client_mut(cid, now)?.last_renewed = now;
 
         self.with_owner_seqid(cid, &owner, owner_seqid, |s| {
@@ -814,12 +812,28 @@ impl Inner {
         })
     }
 
-    fn resolve(&mut self, sid: &stateid4, now: Instant) -> Res<Resolved> {
+    /// The open-owner of `other`, live or just-retired - but only if `cid`
+    /// actually owns it.
+    fn owner_of(&self, cid: clientid4, other: &Other) -> Res<Vec<u8>> {
+        let (holder, owner) = match self.opens.get(other) {
+            Some(open) => (open.clientid, open.owner.clone()),
+            None => self.retired.get(other).cloned().ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?,
+        };
+        if holder != cid {
+            return Err(nfsstat4::NFS4ERR_BAD_STATEID);
+        }
+        Ok(owner)
+    }
+
+    fn resolve(&mut self, cid: clientid4, sid: &stateid4, now: Instant) -> Res<Resolved> {
         match StateRef::from(sid) {
             StateRef::Anonymous => Ok(Resolved::Anonymous),
             StateRef::Bypass => Ok(Resolved::Bypass),
             StateRef::Open { other, seqid } => {
                 let open = self.opens.get(&other).ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
+                if open.clientid != cid {
+                    return Err(nfsstat4::NFS4ERR_BAD_STATEID);
+                }
                 open.check_seqid(seqid)?;
                 let cid = open.clientid;
                 let resolved = Resolved::Open {
@@ -1131,8 +1145,8 @@ impl NFS4State {
     }
 
     /// OPEN_CONFIRM. 4.0 only; a 4.1 client gets NFS4ERR_STALE_CLIENTID.
-    pub(super) fn open_confirm(&self, sid: &stateid4, owner_seqid: seqid4) -> Res<stateid4> {
-        self.lock().open_confirm(sid, owner_seqid, Instant::now())
+    pub(super) fn open_confirm(&self, cid: clientid4, sid: &stateid4, owner_seqid: seqid4) -> Res<stateid4> {
+        self.lock().open_confirm(cid, sid, owner_seqid, Instant::now())
     }
 
     // -- open state --
@@ -1176,13 +1190,13 @@ impl NFS4State {
     }
 
     /// Resolve a stateid for READ/WRITE/etc.
-    pub(super) fn resolve(&self, sid: &stateid4) -> Res<Resolved> {
-        self.lock().resolve(sid, Instant::now())
+    pub(super) fn resolve(&self, cid: clientid4, sid: &stateid4) -> Res<Resolved> {
+        self.lock().resolve(cid, sid, Instant::now())
     }
 
     /// CLOSE. Releases the whole open state and returns the bumped stateid.
-    pub(super) fn close(&self, sid: &stateid4, owner_seqid: OwnerSeqid) -> Res<stateid4> {
-        self.lock().close(sid, owner_seqid, Instant::now())
+    pub(super) fn close(&self, cid: clientid4, sid: &stateid4, owner_seqid: OwnerSeqid) -> Res<stateid4> {
+        self.lock().close(cid, sid, owner_seqid, Instant::now())
     }
 
     /// Reject an op that names an open-owner but which this server does not
@@ -1205,8 +1219,8 @@ impl NFS4State {
     }
 
     /// TEST_STATEID: per-stateid status.
-    pub(super) fn test_stateid(&self, sid: &stateid4) -> nfsstat4 {
-        match self.resolve(sid) {
+    pub(super) fn test_stateid(&self, cid: clientid4, sid: &stateid4) -> nfsstat4 {
+        match self.resolve(cid, sid) {
             Ok(_) => nfsstat4::NFS4_OK,
             Err(e) => e,
         }
@@ -1329,7 +1343,7 @@ mod tests {
         assert!(!opened.confirm_required, "4.1 has no OPEN_CONFIRM");
         assert!(closed.try_recv().is_err(), "handle must stay open while the state lives");
 
-        let closed_sid = inner.close(&opened.stateid, OwnerSeqid::V40(1), now).unwrap();
+        let closed_sid = inner.close(cid, &opened.stateid, OwnerSeqid::V40(1), now).unwrap();
         assert_eq!(closed_sid.other, opened.stateid.other);
         assert_eq!(closed_sid.seqid, 2, "CLOSE bumps the stateid; it did not replay the OPEN");
         assert!(inner.opens.is_empty() && inner.open_index.is_empty());
@@ -1385,7 +1399,7 @@ mod tests {
             .open_commit(cid, b"oo", OwnerSeqid::V41, 42, OpenMode::ReadOnly, handle(), now)
             .unwrap();
 
-        assert_eq!(inner.open_confirm(&opened.stateid, 1, now), Err(nfsstat4::NFS4ERR_STALE_CLIENTID));
+        assert_eq!(inner.open_confirm(cid, &opened.stateid, 1, now), Err(nfsstat4::NFS4ERR_STALE_CLIENTID));
     }
 
     #[test]
@@ -1498,7 +1512,7 @@ mod tests {
             nfsstat4::NFS4ERR_NOTSUPP
         );
         // The CLOSE that used to fail with BAD_SEQID.
-        let sid = inner.close(&opened.stateid, OwnerSeqid::V40(3), now).unwrap();
+        let sid = inner.close(cid, &opened.stateid, OwnerSeqid::V40(3), now).unwrap();
         assert_eq!(sid.other, opened.stateid.other);
         assert_eq!(closed.try_recv().ok(), Some(11));
 
@@ -1547,13 +1561,13 @@ mod tests {
             .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadWrite, fh, now)
             .unwrap();
 
-        let first = inner.close(&opened.stateid, OwnerSeqid::V40(2), now).unwrap();
+        let first = inner.close(cid, &opened.stateid, OwnerSeqid::V40(2), now).unwrap();
         assert_eq!(closed.try_recv().ok(), Some(11));
         // The state is gone, so the retransmit is routed via the tombstone to
         // the open-owner record before it can reach `opens`.
-        assert_eq!(inner.close(&opened.stateid, OwnerSeqid::V40(2), now), Ok(first));
+        assert_eq!(inner.close(cid, &opened.stateid, OwnerSeqid::V40(2), now), Ok(first));
         assert!(closed.try_recv().is_err(), "must not close twice");
-        assert_eq!(inner.close(&opened.stateid, OwnerSeqid::V40(3), now), Err(nfsstat4::NFS4ERR_BAD_STATEID));
+        assert_eq!(inner.close(cid, &opened.stateid, OwnerSeqid::V40(3), now), Err(nfsstat4::NFS4ERR_BAD_STATEID));
         inner.assert_invariants();
     }
 
@@ -1567,11 +1581,11 @@ mod tests {
         let a = inner
             .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadOnly, handle(), now)
             .unwrap();
-        inner.close(&a.stateid, OwnerSeqid::V40(2), now).unwrap();
+        inner.close(cid, &a.stateid, OwnerSeqid::V40(2), now).unwrap();
         let b = inner
             .open_commit(cid, b"oo", OwnerSeqid::V40(3), 43, OpenMode::ReadOnly, handle(), now)
             .unwrap();
-        inner.close(&b.stateid, OwnerSeqid::V40(4), now).unwrap();
+        inner.close(cid, &b.stateid, OwnerSeqid::V40(4), now).unwrap();
 
         assert_eq!(inner.retired.len(), 1);
         assert!(inner.retired.contains_key(&b.stateid.other));
@@ -1592,7 +1606,7 @@ mod tests {
             seqid: 1,
             other: [0xab; NFS4_OTHER_SIZE],
         };
-        assert_eq!(inner.close(&bogus, OwnerSeqid::V40(2), now), Err(nfsstat4::NFS4ERR_BAD_STATEID));
+        assert_eq!(inner.close(cid, &bogus, OwnerSeqid::V40(2), now), Err(nfsstat4::NFS4ERR_BAD_STATEID));
         assert_eq!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(2)), Ok(OwnerSeq::Fresh));
         inner.assert_invariants();
     }
@@ -1607,10 +1621,10 @@ mod tests {
             .unwrap();
         assert!(opened.confirm_required);
 
-        let confirmed = inner.open_confirm(&opened.stateid, 2, now).unwrap();
+        let confirmed = inner.open_confirm(cid, &opened.stateid, 2, now).unwrap();
         assert_eq!(confirmed.other, opened.stateid.other);
         assert_eq!(confirmed.seqid, 2);
-        assert_eq!(inner.open_confirm(&opened.stateid, 2, now), Ok(confirmed), "retransmit replays");
+        assert_eq!(inner.open_confirm(cid, &opened.stateid, 2, now), Ok(confirmed), "retransmit replays");
 
         // Confirmed once, so a later OPEN for this owner does not ask again.
         let again = inner
@@ -1634,7 +1648,7 @@ mod tests {
         let second = inner
             .open_commit(cid, b"oo", OwnerSeqid::V40(2), 43, OpenMode::ReadOnly, other_fh, now)
             .unwrap();
-        inner.close(&second.stateid, OwnerSeqid::V40(3), now).unwrap();
+        inner.close(cid, &second.stateid, OwnerSeqid::V40(3), now).unwrap();
         assert!(!inner.retired.is_empty());
 
         let later = now + LEASE + Duration::from_secs(1);
@@ -1684,10 +1698,10 @@ mod tests {
         let opened = inner
             .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadOnly, handle(), now)
             .unwrap();
-        inner.open_confirm(&opened.stateid, 2, now).unwrap();
+        inner.open_confirm(cid, &opened.stateid, 2, now).unwrap();
 
         // `opened.stateid` is now one behind the open's seqid.
-        assert_eq!(inner.open_confirm(&opened.stateid, 3, now), Err(nfsstat4::NFS4ERR_OLD_STATEID));
+        assert_eq!(inner.open_confirm(cid, &opened.stateid, 3, now), Err(nfsstat4::NFS4ERR_OLD_STATEID));
         assert_eq!(
             inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(3)),
             Ok(OwnerSeq::Replay(Err(nfsstat4::NFS4ERR_OLD_STATEID))),
@@ -1721,7 +1735,7 @@ mod tests {
         let (again, confirm2) = inner.setclientid(b"host", &v1, now);
         assert_eq!(again, cid, "an unrebooted client keeps its clientid");
         assert_eq!(inner.opens.len(), 1, "SETCLIENTID must not destroy open state");
-        assert!(matches!(inner.resolve(&opened.stateid, Instant::now()), Ok(Resolved::Open { .. })));
+        assert!(matches!(inner.resolve(cid, &opened.stateid, Instant::now()), Ok(Resolved::Open { .. })));
         assert!(closed.try_recv().is_err(), "the handle must not be closed");
         inner.setclientid_confirm(cid, &confirm2, now).unwrap();
         assert_eq!(inner.opens.len(), 1, "confirming a retry must not destroy it either");
@@ -1735,7 +1749,7 @@ mod tests {
         assert_ne!(rebooted, cid);
         assert_eq!(inner.by_owner.get(&owner), Some(&cid), "confirmed record still current");
         assert_eq!(inner.unconfirmed.get(&owner), Some(&rebooted));
-        assert!(matches!(inner.resolve(&opened.stateid, Instant::now()), Ok(Resolved::Open { .. })));
+        assert!(matches!(inner.resolve(cid, &opened.stateid, Instant::now()), Ok(Resolved::Open { .. })));
         inner.assert_invariants();
 
         inner.setclientid_confirm(rebooted, &confirm3, now).unwrap();
@@ -1780,17 +1794,59 @@ mod tests {
 
         // Two thirds of a lease in: still live, and this READ renews.
         let mid = now + LEASE * 2 / 3;
-        assert!(matches!(inner.resolve(&opened.stateid, mid), Ok(Resolved::Open { .. })));
+        assert!(matches!(inner.resolve(cid, &opened.stateid, mid), Ok(Resolved::Open { .. })));
 
         // Past the original deadline, but within a lease of the renewal.
         let later = mid + LEASE * 2 / 3;
         assert!(inner.client_mut(cid, later).is_ok(), "the READ must have renewed the lease");
-        assert!(matches!(inner.resolve(&opened.stateid, later), Ok(Resolved::Open { .. })));
+        assert!(matches!(inner.resolve(cid, &opened.stateid, later), Ok(Resolved::Open { .. })));
 
         // A genuine lapse still expires, and takes the open state with it.
         let dead = later + LEASE + Duration::from_secs(1);
-        assert_eq!(inner.resolve(&opened.stateid, dead).err(), Some(nfsstat4::NFS4ERR_EXPIRED));
+        assert_eq!(inner.resolve(cid, &opened.stateid, dead).err(), Some(nfsstat4::NFS4ERR_EXPIRED));
         assert!(inner.clients.is_empty() && inner.opens.is_empty());
+        inner.assert_invariants();
+    }
+
+    /// A stateid belongs to the client it was issued to. Another client's
+    /// READ/WRITE, CLOSE or OPEN_CONFIRM must not reach it, must not close its
+    /// handle, and must not be booked against either open-owner.
+    #[test]
+    fn stateid_is_bound_to_its_client() {
+        let now = Instant::now();
+        let mut inner = inner();
+        let victim = confirmed_v40_client(&mut inner, now);
+        let attacker = inner.install_client(
+            (Minor::V40, b"attacker".to_vec()),
+            verifier4::default(),
+            ClientKind::V40(V40 {
+                confirm_verifier: verifier4::default(),
+                confirmed: true,
+            }),
+            now,
+        );
+
+        let (fh, mut closed) = tracked_handle(11);
+        let opened = inner
+            .open_commit(victim, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadWrite, fh, now)
+            .unwrap();
+
+        assert!(matches!(
+            inner.resolve(attacker, &opened.stateid, Instant::now()),
+            Err(nfsstat4::NFS4ERR_BAD_STATEID)
+        ));
+        assert_eq!(inner.open_confirm(attacker, &opened.stateid, 1, now), Err(nfsstat4::NFS4ERR_BAD_STATEID));
+        assert_eq!(inner.close(attacker, &opened.stateid, OwnerSeqid::V40(1), now), Err(nfsstat4::NFS4ERR_BAD_STATEID));
+
+        // Rejected before any open-owner is touched, and the victim is intact.
+        assert_eq!(inner.check_owner_seqid(attacker, b"oo", OwnerSeqid::V40(1)), Ok(OwnerSeq::Fresh));
+        assert!(closed.try_recv().is_err(), "the victim's handle must stay open");
+        assert!(matches!(inner.resolve(victim, &opened.stateid, Instant::now()), Ok(Resolved::Open { .. })));
+
+        // The CLOSE tombstone is bound to its client too.
+        inner.close(victim, &opened.stateid, OwnerSeqid::V40(2), now).unwrap();
+        assert_eq!(closed.try_recv().ok(), Some(11));
+        assert_eq!(inner.close(attacker, &opened.stateid, OwnerSeqid::V40(1), now), Err(nfsstat4::NFS4ERR_BAD_STATEID));
         inner.assert_invariants();
     }
 }
