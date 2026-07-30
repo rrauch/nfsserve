@@ -494,19 +494,16 @@ impl Inner {
         }
     }
 
-    fn check_owner_seqid(&mut self, cid: clientid4, owner: &[u8], seqid: OwnerSeqid) -> Res<OwnerSeq> {
+    fn check_owner_seqid(&self, cid: clientid4, owner: &[u8], seqid: OwnerSeqid) -> Res<OwnerSeq> {
         let Some(seqid) = self.owner_seqid_for(cid, seqid)? else {
             return Ok(OwnerSeq::Fresh);
         };
-        let client = self.clients.get_mut(&cid).expect("owner_seqid_for resolved it");
+        let client = self.clients.get(&cid).expect("owner_seqid_for resolved it");
         match client.open_owners.get(owner).and_then(|o| o.last.as_ref()) {
             None => Ok(OwnerSeq::Fresh),
             Some((last, reply)) if seqid == *last => Ok(OwnerSeq::Replay(reply.clone())),
             Some((last, _)) if seqid == last.wrapping_add(1) => Ok(OwnerSeq::Fresh),
-            Some(_) => {
-                client.open_owners.remove(owner);
-                Err(nfsstat4::NFS4ERR_BAD_SEQID)
-            },
+            Some(_) => Err(nfsstat4::NFS4ERR_BAD_SEQID),
         }
     }
 
@@ -1847,6 +1844,43 @@ mod tests {
         inner.close(victim, &opened.stateid, OwnerSeqid::V40(2), now).unwrap();
         assert_eq!(closed.try_recv().ok(), Some(11));
         assert_eq!(inner.close(attacker, &opened.stateid, OwnerSeqid::V40(1), now), Err(nfsstat4::NFS4ERR_BAD_STATEID));
+        inner.assert_invariants();
+    }
+
+    /// NFS4ERR_BAD_SEQID is on RFC 7530 §9.1.7's retain list: the client does
+    /// not advance its counter, so the server must not discard the open-owner
+    /// either. Dropping it re-demanded OPEN_CONFIRM, turned every later seqid
+    /// into a `Fresh` (killing replay detection), and orphaned the CLOSE
+    /// tombstone — which `assert_invariants` catches.
+    #[test]
+    fn bad_seqid_preserves_the_open_owner() {
+        let now = Instant::now();
+        let mut inner = inner();
+        let cid = confirmed_v40_client(&mut inner, now);
+
+        let opened = inner
+            .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadOnly, handle(), now)
+            .unwrap();
+        // OPEN_CONFIRM bumps the open's seqid, so CLOSE must carry what it
+        // returned, not the stateid OPEN handed out.
+        let confirmed = inner.open_confirm(cid, &opened.stateid, 2, now).unwrap();
+        let closed = inner.close(cid, &confirmed, OwnerSeqid::V40(3), now).unwrap();
+        assert!(inner.retired.contains_key(&closed.other));
+
+        // A gap in the client's counter.
+        assert_eq!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(9)), Err(nfsstat4::NFS4ERR_BAD_SEQID));
+
+        // Nothing was forgotten...
+        assert_eq!(
+            inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(3)),
+            Ok(OwnerSeq::Replay(Ok(closed))),
+            "the replay record must survive"
+        );
+        assert!(!inner.confirm_required(cid, b"oo"), "OPEN_CONFIRM must not be demanded again");
+        assert!(inner.retired.contains_key(&closed.other), "the tombstone must survive");
+
+        // ...and the legitimate next request is still accepted.
+        assert_eq!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(4)), Ok(OwnerSeq::Fresh));
         inner.assert_invariants();
     }
 }
