@@ -293,6 +293,7 @@ pub(super) struct Opened {
     pub confirm_required: bool,
 }
 
+#[derive(Debug)]
 pub(super) enum Resolved {
     Open {
         fileid: fileid4,
@@ -813,18 +814,21 @@ impl Inner {
         })
     }
 
-    fn resolve(&self, sid: &stateid4) -> Res<Resolved> {
+    fn resolve(&mut self, sid: &stateid4, now: Instant) -> Res<Resolved> {
         match StateRef::from(sid) {
             StateRef::Anonymous => Ok(Resolved::Anonymous),
             StateRef::Bypass => Ok(Resolved::Bypass),
             StateRef::Open { other, seqid } => {
                 let open = self.opens.get(&other).ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
                 open.check_seqid(seqid)?;
-                Ok(Resolved::Open {
+                let cid = open.clientid;
+                let resolved = Resolved::Open {
                     fileid: open.fileid,
                     fh: open.fh.clone(),
                     mode: open.mode,
-                })
+                };
+                self.client_mut(cid, now)?.last_renewed = now;
+                Ok(resolved)
             },
         }
     }
@@ -1173,7 +1177,7 @@ impl NFS4State {
 
     /// Resolve a stateid for READ/WRITE/etc.
     pub(super) fn resolve(&self, sid: &stateid4) -> Res<Resolved> {
-        self.lock().resolve(sid)
+        self.lock().resolve(sid, Instant::now())
     }
 
     /// CLOSE. Releases the whole open state and returns the bumped stateid.
@@ -1717,7 +1721,7 @@ mod tests {
         let (again, confirm2) = inner.setclientid(b"host", &v1, now);
         assert_eq!(again, cid, "an unrebooted client keeps its clientid");
         assert_eq!(inner.opens.len(), 1, "SETCLIENTID must not destroy open state");
-        assert!(matches!(inner.resolve(&opened.stateid), Ok(Resolved::Open { .. })));
+        assert!(matches!(inner.resolve(&opened.stateid, Instant::now()), Ok(Resolved::Open { .. })));
         assert!(closed.try_recv().is_err(), "the handle must not be closed");
         inner.setclientid_confirm(cid, &confirm2, now).unwrap();
         assert_eq!(inner.opens.len(), 1, "confirming a retry must not destroy it either");
@@ -1731,7 +1735,7 @@ mod tests {
         assert_ne!(rebooted, cid);
         assert_eq!(inner.by_owner.get(&owner), Some(&cid), "confirmed record still current");
         assert_eq!(inner.unconfirmed.get(&owner), Some(&rebooted));
-        assert!(matches!(inner.resolve(&opened.stateid), Ok(Resolved::Open { .. })));
+        assert!(matches!(inner.resolve(&opened.stateid, Instant::now()), Ok(Resolved::Open { .. })));
         inner.assert_invariants();
 
         inner.setclientid_confirm(rebooted, &confirm3, now).unwrap();
@@ -1760,6 +1764,33 @@ mod tests {
         let (next, _) = inner.setclientid(b"host", &verifier4::default(), now);
         assert_eq!(next, cid);
         assert!(inner.unconfirmed.is_empty());
+        inner.assert_invariants();
+    }
+
+    /// RFC 7530 §9.5: naming a stateid renews the lease. A client doing nothing
+    /// but READ/WRITE sends no RENEW, so without this it expires mid-transfer.
+    #[test]
+    fn resolve_renews_the_lease() {
+        let now = Instant::now();
+        let mut inner = inner();
+        let cid = confirmed_v40_client(&mut inner, now);
+        let opened = inner
+            .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadWrite, handle(), now)
+            .unwrap();
+
+        // Two thirds of a lease in: still live, and this READ renews.
+        let mid = now + LEASE * 2 / 3;
+        assert!(matches!(inner.resolve(&opened.stateid, mid), Ok(Resolved::Open { .. })));
+
+        // Past the original deadline, but within a lease of the renewal.
+        let later = mid + LEASE * 2 / 3;
+        assert!(inner.client_mut(cid, later).is_ok(), "the READ must have renewed the lease");
+        assert!(matches!(inner.resolve(&opened.stateid, later), Ok(Resolved::Open { .. })));
+
+        // A genuine lapse still expires, and takes the open state with it.
+        let dead = later + LEASE + Duration::from_secs(1);
+        assert_eq!(inner.resolve(&opened.stateid, dead).err(), Some(nfsstat4::NFS4ERR_EXPIRED));
+        assert!(inner.clients.is_empty() && inner.opens.is_empty());
         inner.assert_invariants();
     }
 }
