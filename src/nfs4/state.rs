@@ -327,6 +327,7 @@ struct Inner {
     epoch: u32,
     clients: HashMap<clientid4, Client>,
     by_owner: HashMap<(Minor, Vec<u8>), clientid4>,
+    unconfirmed: HashMap<(Minor, Vec<u8>), clientid4>,
     sessions: HashMap<sessionid4, Session>,
     opens: HashMap<Other, Open>,
     /// (clientid, open_owner, fileid) -> stateid.other. Makes OPEN dedup O(1).
@@ -343,6 +344,7 @@ impl Inner {
             epoch,
             clients: HashMap::new(),
             by_owner: HashMap::new(),
+            unconfirmed: HashMap::new(),
             sessions: HashMap::new(),
             opens: HashMap::new(),
             open_index: HashMap::new(),
@@ -404,11 +406,57 @@ impl Inner {
         let Some(client) = self.clients.remove(&cid) else {
             return;
         };
-        self.by_owner.remove(&client.owner);
+        // Two records may share an owner key, so only retract our own entries.
+        if self.by_owner.get(&client.owner) == Some(&cid) {
+            self.by_owner.remove(&client.owner);
+        }
+        if self.unconfirmed.get(&client.owner) == Some(&cid) {
+            self.unconfirmed.remove(&client.owner);
+        }
         self.sessions.retain(|_, s| s.clientid != cid);
         self.opens.retain(|_, o| o.clientid != cid);
         self.open_index.retain(|(c, _, _), _| *c != cid);
         self.retired.retain(|_, (c, _)| *c != cid);
+    }
+
+    /// Create a record without touching any existing record for `owner` and
+    /// without indexing it; the caller decides which index it belongs in.
+    fn add_client(
+        &mut self,
+        owner: (Minor, Vec<u8>),
+        verifier: verifier4,
+        kind: ClientKind,
+        now: Instant,
+    ) -> clientid4 {
+        let cid = self.fresh_clientid();
+        self.clients.insert(
+            cid,
+            Client {
+                owner,
+                verifier,
+                last_renewed: now,
+                kind,
+                open_owners: HashMap::new(),
+            },
+        );
+        cid
+    }
+
+    /// Replace any confirmed client registered under `owner`, then insert a
+    /// fresh confirmed record.
+    fn install_client(
+        &mut self,
+        owner: (Minor, Vec<u8>),
+        verifier: verifier4,
+        kind: ClientKind,
+        now: Instant,
+    ) -> clientid4 {
+        if let Some(&old) = self.by_owner.get(&owner) {
+            self.remove_client(old);
+        }
+        let cid = self.add_client(owner.clone(), verifier, kind, now);
+        self.by_owner.insert(owner, cid);
+        cid
     }
 
     fn sweep_expired(&mut self, now: Instant) {
@@ -421,32 +469,6 @@ impl Inner {
         for cid in dead {
             self.remove_client(cid);
         }
-    }
-
-    /// Replace any client registered under `owner`, then insert a fresh record.
-    fn install_client(
-        &mut self,
-        owner: (Minor, Vec<u8>),
-        verifier: verifier4,
-        kind: ClientKind,
-        now: Instant,
-    ) -> clientid4 {
-        if let Some(&old) = self.by_owner.get(&owner) {
-            self.remove_client(old);
-        }
-        let cid = self.fresh_clientid();
-        self.by_owner.insert(owner.clone(), cid);
-        self.clients.insert(
-            cid,
-            Client {
-                owner,
-                verifier,
-                last_renewed: now,
-                kind,
-                open_owners: HashMap::new(),
-            },
-        );
-        cid
     }
 
     // -- 4.0 open-owner sequencing --
@@ -688,6 +710,82 @@ impl Inner {
         })
     }
 
+    // -- 4.0 client establishment --
+
+    /// SETCLIENTID (RFC 7530 §16.33.5).
+    ///
+    /// A confirmed record whose verifier still matches means the client did
+    /// *not* reboot — this is a retransmit, a reconnect, or a callback update.
+    /// It keeps its clientid and, crucially, all of its open state; only the
+    /// confirm verifier is re-armed. Minting a new clientid and purging state
+    /// here made every reconnect look like a reboot and silently closed the
+    /// client's files underneath it.
+    fn setclientid(&mut self, ownerid: &[u8], verifier: &verifier4, now: Instant) -> (clientid4, verifier4) {
+        let owner = (Minor::V40, ownerid.to_vec());
+
+        let mut confirm = verifier4::default();
+        getrandom::fill(&mut confirm).expect("OS RNG failure");
+
+        // Any earlier unconfirmed attempt is superseded. It can own no state:
+        // `open_plan` rejects unconfirmed clients.
+        if let Some(&stale) = self.unconfirmed.get(&owner) {
+            self.remove_client(stale);
+        }
+
+        if let Some(&cid) = self.by_owner.get(&owner) {
+            if self
+                .clients
+                .get(&cid)
+                .is_some_and(|c| c.verifier == *verifier && c.is_confirmed())
+            {
+                let client = self.clients.get_mut(&cid).expect("just checked");
+                client.last_renewed = now;
+                client.kind.v40_mut().expect("keyed by minor version").confirm_verifier = confirm;
+                return (cid, confirm);
+            }
+        }
+
+        // New client, or one whose verifier changed (reboot). The previous
+        // incarnation's state survives until SETCLIENTID_CONFIRM proves it.
+        let kind = ClientKind::V40(V40 {
+            confirm_verifier: confirm,
+            confirmed: false,
+        });
+        let cid = self.add_client(owner.clone(), *verifier, kind, now);
+        self.unconfirmed.insert(owner, cid);
+        (cid, confirm)
+    }
+
+    /// SETCLIENTID_CONFIRM (RFC 7530 §16.34.5). Idempotent: confirming an
+    /// already-confirmed record is a retransmit and must not disturb state.
+    fn setclientid_confirm(&mut self, cid: clientid4, confirm: &verifier4, now: Instant) -> Res<()> {
+        let (owner, already) = {
+            let client = self.client_mut(cid, now)?;
+            let owner = client.owner.clone();
+            let v40 = client.kind.v40_mut()?;
+            if v40.confirm_verifier != *confirm {
+                return Err(nfsstat4::NFS4ERR_STALE_CLIENTID);
+            }
+            let already = v40.confirmed;
+            v40.confirmed = true;
+            client.last_renewed = now;
+            (owner, already)
+        };
+
+        if !already {
+            // The reboot is now proven, so — and only now — the previous
+            // incarnation and its state go away.
+            if let Some(&old) = self.by_owner.get(&owner) {
+                if old != cid {
+                    self.remove_client(old);
+                }
+            }
+            self.unconfirmed.remove(&owner);
+            self.by_owner.insert(owner, cid);
+        }
+        Ok(())
+    }
+
     /// CLOSE. Releases the whole open state and returns the bumped stateid.
     /// Dropping the `Open` hands its handle to the background closer, so the
     /// replay short-circuit must only fire for a genuine 4.0 retransmit.
@@ -785,6 +883,11 @@ impl Inner {
                 "retired index out of sync"
             );
             assert!(!self.opens.contains_key(other), "retired stateid is still live");
+        }
+        for (owner, cid) in &self.unconfirmed {
+            assert_eq!(self.clients.get(cid).map(|c| &c.owner), Some(owner), "unconfirmed out of sync");
+            assert!(!self.clients[cid].is_confirmed(), "confirmed client in the unconfirmed index");
+            assert_ne!(self.by_owner.get(owner), Some(cid), "record cannot be in both indexes");
         }
     }
 }
@@ -1004,35 +1107,15 @@ impl NFS4State {
 
     // -- NFSv4.0: clientid --
 
-    /// SETCLIENTID. Always issues a fresh clientid and replaces any previous
-    /// record for this owner, so no stale index entry can survive.
+    /// SETCLIENTID. A retry from an unrebooted client returns its existing
+    /// clientid and preserves its open state.
     pub(super) fn setclientid(&self, ownerid: &[u8], verifier: &verifier4) -> (clientid4, verifier4) {
-        let now = Instant::now();
-        let mut g = self.lock();
-
-        let mut confirm = verifier4::default();
-        getrandom::fill(&mut confirm).expect("OS RNG failure");
-
-        let kind = ClientKind::V40(V40 {
-            confirm_verifier: confirm,
-            confirmed: false,
-        });
-        let cid = g.install_client((Minor::V40, ownerid.to_vec()), *verifier, kind, now);
-        (cid, confirm)
+        self.lock().setclientid(ownerid, verifier, Instant::now())
     }
 
     /// SETCLIENTID_CONFIRM. Idempotent, so retransmits succeed.
     pub(super) fn setclientid_confirm(&self, cid: clientid4, confirm: &verifier4) -> Res<()> {
-        let now = Instant::now();
-        let mut g = self.lock();
-        let client = g.client_mut(cid, now)?;
-        let v40 = client.kind.v40_mut()?;
-        if v40.confirm_verifier != *confirm {
-            return Err(nfsstat4::NFS4ERR_CLID_INUSE);
-        }
-        v40.confirmed = true;
-        client.last_renewed = now;
-        Ok(())
+        self.lock().setclientid_confirm(cid, confirm, Instant::now())
     }
 
     /// RENEW.
@@ -1607,6 +1690,76 @@ mod tests {
             "the failure was booked, so its retransmit replays"
         );
         assert_eq!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(4)), Ok(OwnerSeq::Fresh));
+        inner.assert_invariants();
+    }
+
+    /// The regression: a SETCLIENTID retry from a client that had *not*
+    /// rebooted minted a new clientid and purged the old record, closing every
+    /// open file. Linux clients re-send SETCLIENTID on reconnect, so a mount
+    /// would lose its handles mid-flight. State may only be discarded once a
+    /// *changed* verifier has been confirmed.
+    #[test]
+    fn setclientid_retry_keeps_state_and_only_a_confirmed_reboot_drops_it() {
+        let now = Instant::now();
+        let mut inner = inner();
+        let owner = (Minor::V40, b"host".to_vec());
+        let v1 = verifier4::default();
+
+        let (cid, confirm) = inner.setclientid(b"host", &v1, now);
+        inner.setclientid_confirm(cid, &confirm, now).unwrap();
+
+        let (fh, mut closed) = tracked_handle(11);
+        let opened = inner
+            .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadWrite, fh, now)
+            .unwrap();
+
+        // Retry, same verifier: same clientid, state untouched.
+        let (again, confirm2) = inner.setclientid(b"host", &v1, now);
+        assert_eq!(again, cid, "an unrebooted client keeps its clientid");
+        assert_eq!(inner.opens.len(), 1, "SETCLIENTID must not destroy open state");
+        assert!(matches!(inner.resolve(&opened.stateid), Ok(Resolved::Open { .. })));
+        assert!(closed.try_recv().is_err(), "the handle must not be closed");
+        inner.setclientid_confirm(cid, &confirm2, now).unwrap();
+        assert_eq!(inner.opens.len(), 1, "confirming a retry must not destroy it either");
+        inner.assert_invariants();
+
+        // Reboot: a different verifier gets a new, unconfirmed record, and the
+        // old incarnation stays fully usable until the confirm lands.
+        let mut v2 = verifier4::default();
+        v2[0] ^= 1;
+        let (rebooted, confirm3) = inner.setclientid(b"host", &v2, now);
+        assert_ne!(rebooted, cid);
+        assert_eq!(inner.by_owner.get(&owner), Some(&cid), "confirmed record still current");
+        assert_eq!(inner.unconfirmed.get(&owner), Some(&rebooted));
+        assert!(matches!(inner.resolve(&opened.stateid), Ok(Resolved::Open { .. })));
+        inner.assert_invariants();
+
+        inner.setclientid_confirm(rebooted, &confirm3, now).unwrap();
+        assert!(!inner.clients.contains_key(&cid), "the old incarnation is gone");
+        assert!(inner.opens.is_empty() && inner.open_index.is_empty());
+        assert_eq!(closed.try_recv().ok(), Some(11), "the reboot closes the handle");
+        assert_eq!(inner.by_owner.get(&owner), Some(&rebooted));
+        assert!(inner.unconfirmed.is_empty());
+        inner.assert_invariants();
+    }
+
+    #[test]
+    fn setclientid_confirm_rejects_a_wrong_verifier_without_touching_state() {
+        let now = Instant::now();
+        let mut inner = inner();
+        let (cid, confirm) = inner.setclientid(b"host", &verifier4::default(), now);
+
+        let mut wrong = confirm;
+        wrong[0] ^= 1;
+        assert_eq!(inner.setclientid_confirm(cid, &wrong, now), Err(nfsstat4::NFS4ERR_STALE_CLIENTID));
+        assert!(!inner.clients[&cid].is_confirmed());
+
+        inner.setclientid_confirm(cid, &confirm, now).unwrap();
+        assert!(inner.clients[&cid].is_confirmed());
+        // A superseded unconfirmed attempt must not linger in the index.
+        let (next, _) = inner.setclientid(b"host", &verifier4::default(), now);
+        assert_eq!(next, cid);
+        assert!(inner.unconfirmed.is_empty());
         inner.assert_invariants();
     }
 }
