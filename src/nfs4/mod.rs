@@ -1956,3 +1956,146 @@ struct TEST_STATEID4resok {
     tsr_status_codes: Vec<nfsstat4>,
 }
 xdr_struct!(TEST_STATEID4resok, tsr_status_codes);
+
+// ---- OPEN_DOWNGRADE (RFC 8881 §18.18, RFC 7530 §16.19) ----
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OPEN_DOWNGRADE4args {
+    open_stateid: stateid4,
+    seqid: seqid4,
+    share_access: u32,
+    share_deny: u32,
+}
+xdr_struct!(OPEN_DOWNGRADE4args, open_stateid, seqid, share_access, share_deny);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct OPEN_DOWNGRADE4resok {
+    open_stateid: stateid4,
+}
+xdr_struct!(OPEN_DOWNGRADE4resok, open_stateid);
+
+// ---- LOCK / LOCKT / LOCKU (RFC 8881 §18.10–§18.12) ----
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq, FromPrimitive, ToPrimitive)]
+#[repr(u32)]
+enum nfs_lock_type4 {
+    #[default]
+    READ_LT = 1,
+    WRITE_LT = 2,
+    READW_LT = 3,
+    WRITEW_LT = 4,
+}
+xdr_enum_serde!(nfs_lock_type4);
+
+/// A LOCK that establishes a new lock-owner: carries the open-owner's seqid
+/// and stateid alongside the fresh lock-owner's.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct open_to_lock_owner4 {
+    open_seqid: seqid4,
+    open_stateid: stateid4,
+    lock_seqid: seqid4,
+    lock_owner: lock_owner4,
+}
+xdr_struct!(open_to_lock_owner4, open_seqid, open_stateid, lock_seqid, lock_owner);
+
+/// A LOCK against an already-established lock-owner. No open-owner seqid.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct exist_lock_owner4 {
+    lock_stateid: stateid4,
+    lock_seqid: seqid4,
+}
+xdr_struct!(exist_lock_owner4, lock_stateid, lock_seqid);
+
+/// locker4: union switched on `new_lock_owner` (bool).
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum locker4 {
+    /// TRUE: names the open-owner, so its seqid must be booked.
+    OpenOwner(open_to_lock_owner4),
+    /// FALSE: names only an existing lock-owner.
+    LockOwner(exist_lock_owner4),
+}
+
+impl Default for locker4 {
+    fn default() -> Self {
+        Self::LockOwner(exist_lock_owner4::default())
+    }
+}
+
+impl XDR for locker4 {
+    fn serialize<W: Write>(&self, dest: &mut W) -> std::io::Result<()> {
+        match self {
+            Self::OpenOwner(o) => {
+                true.serialize(dest)?;
+                o.serialize(dest)
+            },
+            Self::LockOwner(l) => {
+                false.serialize(dest)?;
+                l.serialize(dest)
+            },
+        }
+    }
+    fn deserialize<R: Read>(&mut self, src: &mut R) -> std::io::Result<()> {
+        let mut new_lock_owner = false;
+        new_lock_owner.deserialize(src)?;
+        *self = if new_lock_owner {
+            let mut o = open_to_lock_owner4::default();
+            o.deserialize(src)?;
+            Self::OpenOwner(o)
+        } else {
+            let mut l = exist_lock_owner4::default();
+            l.deserialize(src)?;
+            Self::LockOwner(l)
+        };
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LOCK4args {
+    locktype: nfs_lock_type4,
+    reclaim: bool,
+    offset: offset4,
+    length: length4,
+    locker: locker4,
+}
+xdr_struct!(LOCK4args, locktype, reclaim, offset, length, locker);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LOCK4resok {
+    lock_stateid: stateid4,
+}
+xdr_struct!(LOCK4resok, lock_stateid);
+
+/// The NFS4ERR_DENIED arm of LOCK4res and LOCKT4res. We never grant locks, so
+/// we never deny one either; kept for completeness of the union.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LOCK4denied {
+    offset: offset4,
+    length: length4,
+    locktype: nfs_lock_type4,
+    owner: lock_owner4,
+}
+xdr_struct!(LOCK4denied, offset, length, locktype, owner);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LOCKT4args {
+    locktype: nfs_lock_type4,
+    offset: offset4,
+    length: length4,
+    owner: lock_owner4,
+}
+xdr_struct!(LOCKT4args, locktype, offset, length, owner);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LOCKU4args {
+    locktype: nfs_lock_type4,
+    seqid: seqid4,
+    lock_stateid: stateid4,
+    offset: offset4,
+    length: length4,
+}
+xdr_struct!(LOCKU4args, locktype, seqid, lock_stateid, offset, length);
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LOCKU4resok {
+    lock_stateid: stateid4,
+}
+xdr_struct!(LOCKU4resok, lock_stateid);

@@ -962,6 +962,46 @@ impl Inner {
         }
         self.retired.insert(other, (cid, owner.to_vec()));
     }
+
+    /// OPEN_DOWNGRADE (RFC 7530 §16.19).
+    fn open_downgrade(
+        &mut self,
+        cid: clientid4,
+        sid: &stateid4,
+        owner_seqid: OwnerSeqid,
+        now: Instant,
+    ) -> Res<stateid4> {
+        let StateRef::Open { other, seqid } = StateRef::from(sid) else {
+            return Err(nfsstat4::NFS4ERR_BAD_STATEID);
+        };
+        let owner = self.owner_of(cid, &other)?;
+        self.client_mut(cid, now)?.last_renewed = now;
+
+        self.with_owner_seqid(cid, &owner, owner_seqid, |s| {
+            let open = s.open_mut(cid, &other)?;
+            open.check_seqid(seqid)?;
+            Ok(open.bump(other))
+        })
+    }
+
+    /// `note_owner_rejection` for an op that names its open-owner only through
+    /// a stateid (LOCK's `open_to_lock_owner4`).
+    fn note_stateid_rejection(
+        &mut self,
+        cid: clientid4,
+        sid: &stateid4,
+        owner_seqid: OwnerSeqid,
+        status: nfsstat4,
+        now: Instant,
+    ) -> nfsstat4 {
+        let StateRef::Open { other, .. } = StateRef::from(sid) else {
+            return nfsstat4::NFS4ERR_BAD_STATEID; // retained: consumes nothing
+        };
+        match self.owner_of(cid, &other) {
+            Ok(owner) => self.note_owner_rejection(cid, &owner, owner_seqid, status, now),
+            Err(e) => e,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1349,6 +1389,23 @@ impl NFS4State {
             Ok(_) => nfsstat4::NFS4_OK,
             Err(e) => e,
         }
+    }
+
+    /// OPEN_DOWNGRADE. 4.0 only in practice; 4.1 passes `OwnerSeqid::V41`.
+    pub(super) fn open_downgrade(&self, cid: clientid4, sid: &stateid4, owner_seqid: OwnerSeqid) -> Res<stateid4> {
+        self.lock().open_downgrade(cid, sid, owner_seqid, Instant::now())
+    }
+
+    /// As `reject_owner_op`, for an op that identifies the open-owner by stateid.
+    pub(super) fn reject_stateid_owner_op(
+        &self,
+        cid: clientid4,
+        sid: &stateid4,
+        owner_seqid: OwnerSeqid,
+        status: nfsstat4,
+    ) -> nfsstat4 {
+        self.lock()
+            .note_stateid_rejection(cid, sid, owner_seqid, status, Instant::now())
     }
 }
 
@@ -2082,6 +2139,97 @@ mod tests {
 
         inner.remove_client(c);
         assert!(inner.sessions().is_empty(), "session locator not retracted");
+        inner.assert_invariants();
+    }
+
+    /// macOS TextEdit's save: OPEN(BOTH), OPEN_CONFIRM, WRITE, OPEN_DOWNGRADE
+    /// to read-only, CLOSE. OPEN_DOWNGRADE names the open-owner and consumes
+    /// its seqid whatever the server does with it (RFC 7530 §9.1.7), so
+    /// answering NFS4ERR_NOTSUPP without booking it left the mirror one behind
+    /// and drew NFS4ERR_BAD_SEQID on the CLOSE — and on every OPEN/CLOSE from
+    /// that open-owner thereafter, for the life of the mount.
+    #[test]
+    fn open_downgrade_keeps_the_owner_seqid_level() {
+        let now = Instant::now();
+        let mut inner = inner();
+        let cid = confirmed_v40_client(&mut inner, now);
+        let (fh, mut closed) = tracked_handle(11);
+
+        let opened = inner
+            .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadWrite, fh, now)
+            .unwrap();
+        let confirmed = inner.open_confirm(cid, &opened.stateid, 2, now).unwrap();
+
+        // The downgrade: next seqid, carrying the stateid OPEN_CONFIRM returned.
+        let down = inner
+            .open_downgrade(cid, &confirmed, OwnerSeqid::V40(3), now)
+            .expect("OPEN_DOWNGRADE must be answered, not rejected");
+        assert_eq!(down.other, confirmed.other, "same open state");
+        assert_eq!(down.seqid, confirmed.seqid + 1, "a downgrade advances the stateid");
+        assert!(closed.try_recv().is_err(), "the state is still open");
+
+        // The state stays usable through the surviving handle.
+        assert!(matches!(inner.resolve(cid, &down, now), Ok(Resolved::Open { .. })));
+
+        // The CLOSE that used to fail with BAD_SEQID.
+        let sid = inner
+            .close(cid, &down, OwnerSeqid::V40(4), now)
+            .expect("the downgrade must have consumed seqid 3");
+        assert_eq!(sid.other, confirmed.other);
+        assert_eq!(closed.try_recv().ok(), Some(11), "CLOSE releases the handle");
+        assert!(inner.opens().is_empty() && inner.open_index_len() == 0);
+        inner.assert_invariants();
+    }
+
+    /// A retransmitted OPEN_DOWNGRADE replays; it must not advance twice, and
+    /// must not leave a gap that the following CLOSE falls into.
+    #[test]
+    fn open_downgrade_retransmit_replays() {
+        let now = Instant::now();
+        let mut inner = inner();
+        let cid = confirmed_v40_client(&mut inner, now);
+        let opened = inner
+            .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadWrite, handle(), now)
+            .unwrap();
+        let confirmed = inner.open_confirm(cid, &opened.stateid, 2, now).unwrap();
+
+        let down = inner.open_downgrade(cid, &confirmed, OwnerSeqid::V40(3), now).unwrap();
+        // Same seqid *and* the now-superseded stateid, as a retransmit carries.
+        assert_eq!(
+            inner.open_downgrade(cid, &confirmed, OwnerSeqid::V40(3), now),
+            Ok(down),
+            "retransmit replays the recorded reply"
+        );
+        assert_eq!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(4)), Ok(OwnerSeq::Fresh));
+        inner.assert_invariants();
+    }
+
+    /// LOCK is unsupported, but `open_to_lock_owner4` still consumes the
+    /// open-owner's seqid, so the rejection has to be booked like any reply.
+    #[test]
+    fn rejected_lock_books_the_open_owner_seqid() {
+        let now = Instant::now();
+        let mut inner = inner();
+        let cid = confirmed_v40_client(&mut inner, now);
+        let opened = inner
+            .open_commit(cid, b"oo", OwnerSeqid::V40(1), 42, OpenMode::ReadWrite, handle(), now)
+            .unwrap();
+
+        assert_eq!(
+            inner.note_stateid_rejection(cid, &opened.stateid, OwnerSeqid::V40(2), nfsstat4::NFS4ERR_NOTSUPP, now),
+            nfsstat4::NFS4ERR_NOTSUPP
+        );
+        assert_eq!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(3)), Ok(OwnerSeq::Fresh));
+        // An unknown stateid is BAD_STATEID — retained, so nothing is booked.
+        let bogus = stateid4 {
+            seqid: 1,
+            other: [0xab; NFS4_OTHER_SIZE],
+        };
+        assert_eq!(
+            inner.note_stateid_rejection(cid, &bogus, OwnerSeqid::V40(3), nfsstat4::NFS4ERR_NOTSUPP, now),
+            nfsstat4::NFS4ERR_BAD_STATEID
+        );
+        assert_eq!(inner.check_owner_seqid(cid, b"oo", OwnerSeqid::V40(3)), Ok(OwnerSeq::Fresh));
         inner.assert_invariants();
     }
 }

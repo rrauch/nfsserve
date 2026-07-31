@@ -198,10 +198,12 @@ fn check_stateid(
             if sid_fileid != fileid {
                 return Err(nfsstat4::NFS4ERR_BAD_STATEID.into());
             }
-            match (need, mode) {
-                (Need::Read, OpenMode::ReadOnly) => {},
-                (Need::Write, OpenMode::ReadWrite) => {},
-                _ => return Err(nfsstat4::NFS4ERR_OPENMODE.into()),
+            let ok = match need {
+                Need::Read => true,
+                Need::Write => matches!(mode, OpenMode::ReadWrite),
+            };
+            if !ok {
+                return Err(nfsstat4::NFS4ERR_OPENMODE.into());
             }
             Ok(Some(vfs_fh))
         },
@@ -441,6 +443,9 @@ async fn dispatch_op(
         OP_COMMIT => run!(op_commit(input, op_out, state, context)),
         OP_TEST_STATEID => run!(op_test_stateid(input, op_out, state, context)),
         OP_SECINFO => run!(op_secinfo(input, op_out, state, context)),
+        OP_OPEN_DOWNGRADE => run!(op_open_downgrade(input, op_out, state, context)),
+        OP_LOCK => run!(op_lock(input, op_out, state, context)),
+        OP_LOCKU => run!(op_locku(input, op_out, state, context)),
         other => {
             warn!("nfs4: unimplemented op {:?}", other);
             nfsstat4::NFS4ERR_NOTSUPP.serialize(op_out)?;
@@ -774,6 +779,92 @@ async fn op_secinfo(
     // SECINFO consumes the current filehandle.
     state.current_fh = None;
     Ok(())
+}
+
+/// OP_OPEN_DOWNGRADE (RFC 7530 §16.19, RFC 8881 §18.18).
+/// Deliberately does no validation of its own: every status this could invent
+/// consumes the client's open-owner seqid, so all failures must come back
+/// through the state layer, which books them.
+async fn op_open_downgrade(
+    input: &mut impl Read,
+    op_out: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = OPEN_DOWNGRADE4args::default();
+    args.deserialize(input)?;
+
+    state.require_session()?;
+    state.current_fh()?; // NOFILEHANDLE is on §9.1.7's retain list
+
+    debug!(
+        "OP_OPEN_DOWNGRADE seqid={} access={:#x} deny={:#x} stateid.seqid={}",
+        args.seqid, args.share_access, args.share_deny, args.open_stateid.seqid
+    );
+
+    let seqid = if state.minorversion == 0 {
+        OwnerSeqid::V40(args.seqid)
+    } else {
+        OwnerSeqid::V41
+    };
+    let cid = context.client_id().ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
+    let stateid = context.nfs4_state.open_downgrade(cid, &args.open_stateid, seqid)?;
+
+    nfsstat4::NFS4_OK.serialize(op_out)?;
+    stateid.serialize(op_out)?;
+    Ok(())
+}
+
+/// OP_LOCK. Unsupported — but `open_to_lock_owner4` consumes the *open*-owner's
+/// seqid, so the rejection is booked rather than merely returned.
+async fn op_lock(
+    input: &mut impl Read,
+    _: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = LOCK4args::default();
+    args.deserialize(input)?;
+    state.require_session()?;
+    state.current_fh()?;
+    let cid = context.client_id().ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
+    Err(match &args.locker {
+        locker4::OpenOwner(o) => {
+            let seqid = if state.minorversion == 0 {
+                OwnerSeqid::V40(o.open_seqid)
+            } else {
+                OwnerSeqid::V41
+            };
+            context
+                .nfs4_state
+                .reject_stateid_owner_op(cid, &o.open_stateid, seqid, nfsstat4::NFS4ERR_NOTSUPP)
+        },
+        _ => nfsstat4::NFS4ERR_NOTSUPP, // lock-owner seqid only; no open-owner state
+    }
+    .into())
+}
+
+async fn op_locku(
+    input: &mut impl Read,
+    _: &mut impl Write,
+    state: &mut CompoundState,
+    context: &RPCContext,
+) -> Result<(), OpError> {
+    let mut args = LOCKU4args::default();
+    args.deserialize(input)?;
+    state.require_session()?;
+    state.current_fh()?;
+    let cid = context.client_id().ok_or(nfsstat4::NFS4ERR_BAD_STATEID)?;
+    let seqid = if state.minorversion == 0 {
+        OwnerSeqid::V40(args.seqid)
+    } else {
+        OwnerSeqid::V41
+    };
+
+    Err(context
+        .nfs4_state
+        .reject_stateid_owner_op(cid, &args.lock_stateid, seqid, nfsstat4::NFS4ERR_NOTSUPP)
+        .into())
 }
 
 /// OP_PUTROOTFH (RFC 8881 §18.21).
